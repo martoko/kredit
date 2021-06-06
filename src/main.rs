@@ -150,7 +150,7 @@ fn accept_connection(stream: TcpStream) -> (JoinHandle<io::Result<()>>, Sender<M
                         if let Err(err) = writer.flush() {
                             eprintln!("Connection closed {}->{}: {}",
                                       local_addr, peer_addr, err);
-                            break;
+                            break 'main;
                         }
                     }
                     Err(e) if e == TryRecvError::Empty => {
@@ -168,24 +168,6 @@ fn accept_connection(stream: TcpStream) -> (JoinHandle<io::Result<()>>, Sender<M
     });
 
     (connection_thread, connection_sender)
-}
-
-// TODO: Use buffer?
-pub fn read_line() -> crossterm::Result<String> {
-    let mut line = String::new();
-    while let crossterm::event::Event::Key(crossterm::event::KeyEvent { code, .. }) = crossterm::event::read()? {
-        match code {
-            crossterm::event::KeyCode::Enter => {
-                break;
-            }
-            crossterm::event::KeyCode::Char(c) => {
-                line.push(c);
-            }
-            _ => {}
-        }
-    }
-
-    Ok(line)
 }
 
 fn main() -> std::io::Result<()> {
@@ -271,6 +253,7 @@ fn main() -> std::io::Result<()> {
     }
 
     let mut terminal_input = true;
+    let mut command = String::new();
     loop {
         if quit_requested.load(Ordering::SeqCst) {
             server_sender.send(MessageType::Quit).unwrap();
@@ -282,12 +265,22 @@ fn main() -> std::io::Result<()> {
             match crossterm::event::poll(Duration::from_secs(0)) {
                 Ok(true) => {
                     // It's guaranteed that read() wont block if `poll` returns `Ok(true)`
-                    let command = read_line().unwrap();
-
-                    if command == "ping" || command == "p" {
-                        server_sender.send(MessageType::SendPing).unwrap();
-                    } else if command == "quit" || command == "q" {
-                        quit_requested.store(true, Ordering::SeqCst);
+                    if let crossterm::event::Event::Key(crossterm::event::KeyEvent { code, .. })
+                    = crossterm::event::read().unwrap() {
+                        match code {
+                            crossterm::event::KeyCode::Enter => {
+                                if command == "ping" || command == "p" {
+                                    server_sender.send(MessageType::SendPing).unwrap();
+                                } else if command == "quit" || command == "q" {
+                                    quit_requested.store(true, Ordering::SeqCst);
+                                }
+                                command.clear();
+                            }
+                            crossterm::event::KeyCode::Char(c) => {
+                                command.push(c);
+                            }
+                            _ => {}
+                        }
                     }
                 }
                 Ok(false) => {
