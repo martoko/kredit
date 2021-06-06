@@ -1,4 +1,4 @@
-#![allow(dead_code, unused_imports, unused_variables, unused_mut)]
+#![allow(unused_imports)]
 
 use std::net::{TcpListener, TcpStream, SocketAddr};
 use std::str::FromStr;
@@ -18,6 +18,7 @@ use std::convert::{TryInto, TryFrom};
 use std::fmt::{Display, Formatter};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::process::exit;
+use std::collections::HashMap;
 
 #[derive(Debug, Copy, Clone)]
 struct Block {
@@ -38,31 +39,87 @@ impl Block {
         sha256.update(self.time.to_le_bytes());
         sha256.finalize().into()
     }
+
+    fn deserialize(reader: &mut dyn Read) -> io::Result<Block> {
+        let mut buffer = [0; 32 + 32 + 8 + 1 + 8];
+        let mut bytes_read = 0;
+        while bytes_read < buffer.len() {
+            match reader.read(&mut buffer[bytes_read..]) {
+                Ok(x) => bytes_read += x,
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    eprintln!("Have read this so far {:?}", buffer);
+                    eprintln!("Would block, waiting...");
+                    // TODO: Replace with something smarter and OS dependant
+                    sleep(Duration::from_millis(10));
+                }
+                Err(e) => return Err(e),
+            };
+        }
+
+        Ok(Block {
+            parent_hash: buffer[0..32].try_into().unwrap(),
+            miner_address: buffer[32..64].try_into().unwrap(),
+            nonce: u64::from_le_bytes(buffer[64..72].try_into().unwrap()),
+            difficulty: buffer[72].try_into().unwrap(),
+            time: u64::from_le_bytes(buffer[73..81].try_into().unwrap()),
+        })
+    }
+
+    fn serialize(&self, writer: &mut dyn Write) {
+        let mut buffer = vec![0; 0];
+        for byte in self.parent_hash { buffer.push(byte); }
+        for byte in self.miner_address { buffer.push(byte); }
+        for byte in self.nonce.to_le_bytes() { buffer.push(byte); }
+        for byte in self.difficulty.to_le_bytes() { buffer.push(byte); }
+        for byte in self.time.to_le_bytes() { buffer.push(byte); }
+        writer.write_all(&buffer).unwrap();
+    }
 }
 
 impl fmt::Display for Block {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{{\nhash: {},\nparent_hash: {},\nminer_address: {},\nnonce: {},\ntime: {}\n}}",
+        write!(f, "{{\n\
+        hash: {},\n\
+        parent_hash: {},\n\
+        miner_address: {},\n\
+        nonce: {},\n\
+        time: {},\n\
+        difficulty: {}\n\
+        }}",
                hex::encode(self.hash()),
                hex::encode(self.parent_hash),
                hex::encode(self.miner_address),
                hex::encode(self.nonce.to_le_bytes()),
-               self.time)
+               self.time,
+               self.difficulty)
     }
 }
 
-struct MinerJob {
-    parent_block: Block,
+#[derive(Debug, Copy, Clone)]
+enum MinerMessage {
+    Start(Block),
+    Pause,
+    Quit,
 }
 
+#[derive(Debug, Copy, Clone)]
+struct NewBlock {
+    block: Block,
+    from: Option<SocketAddr>,
+}
+
+#[derive(Debug, Copy, Clone)]
 enum ConnectionMessage {
     Quit,
     SendPing,
+    NewBlock(NewBlock),
 }
 
+#[derive(Debug, Copy, Clone)]
 enum NetworkedMessageType {
     Ping,
     Pong,
+    Block,
 }
 
 impl TryFrom<u8> for NetworkedMessageType {
@@ -72,6 +129,7 @@ impl TryFrom<u8> for NetworkedMessageType {
         match value {
             x if x == NetworkedMessageType::Ping as u8 => Ok(NetworkedMessageType::Ping),
             x if x == NetworkedMessageType::Pong as u8 => Ok(NetworkedMessageType::Pong),
+            x if x == NetworkedMessageType::Block as u8 => Ok(NetworkedMessageType::Block),
             _ => Err(()),
         }
     }
@@ -90,7 +148,8 @@ fn difficulty(hash: [u8; 32]) -> u8 {
     trailing_zeros
 }
 
-fn accept_connection(stream: TcpStream) -> (JoinHandle<io::Result<()>>, Sender<ConnectionMessage>) {
+fn accept_connection(stream: TcpStream, main_sender: Sender<NewBlock>)
+                     -> (JoinHandle<io::Result<()>>, Sender<ConnectionMessage>) {
     stream.set_nonblocking(true).unwrap();
     let peer_addr = stream.peer_addr().unwrap();
     let local_addr = stream.local_addr().unwrap();
@@ -100,14 +159,14 @@ fn accept_connection(stream: TcpStream) -> (JoinHandle<io::Result<()>>, Sender<C
         let mut writer = BufWriter::new(&stream);
 
         'main: loop {
-            let mut buffer = vec![0; 1024];
+            let mut buffer = vec![0; 1];
             'stream_events: loop {
                 match Read::read(&mut (&stream), &mut buffer) {
                     Ok(0) => {
                         // connection closed
                         break 'stream_events;
                     }
-                    Ok(count) => {
+                    Ok(1) => {
                         match buffer[0].try_into() {
                             Ok(NetworkedMessageType::Ping) => {
                                 eprintln!("Ping!");
@@ -117,18 +176,22 @@ fn accept_connection(stream: TcpStream) -> (JoinHandle<io::Result<()>>, Sender<C
                             Ok(NetworkedMessageType::Pong) => {
                                 eprintln!("Pong!");
                             }
-                            Err(e) => {
+                            Ok(NetworkedMessageType::Block) => {
+                                eprintln!("Parsing block...");
+                                let block = Block::deserialize(&mut (&stream)).unwrap();
+                                main_sender.send(NewBlock { block, from: Some(peer_addr) }).unwrap();
+                            }
+                            Err(()) => {
                                 eprintln!("Received invalid message type {}", buffer[0]);
                                 break 'main;
                             }
                         }
                     }
+                    Ok(count) => panic!("Impossible amount of bytes read {}", count),
                     Err(error) if error.kind() == ErrorKind::WouldBlock => {
                         break 'stream_events;
                     }
-                    Err(error) => {
-                        panic!("error reading {:?}", error);
-                    }
+                    Err(error) => panic!("error reading {:?}", error),
                 }
             }
 
@@ -144,6 +207,18 @@ fn accept_connection(stream: TcpStream) -> (JoinHandle<io::Result<()>>, Sender<C
                             eprintln!("Connection closed {}->{}: {}",
                                       local_addr, peer_addr, err);
                             break 'main;
+                        }
+                    }
+                    Ok(ConnectionMessage::NewBlock(NewBlock { block, from })) => {
+                        let should_skip = from.map(|f| f == peer_addr).unwrap_or(false);
+                        if !should_skip {
+                            writer.write(&[NetworkedMessageType::Block as u8]).unwrap();
+                            block.serialize(&mut writer);
+                            if let Err(err) = writer.flush() {
+                                eprintln!("Connection closed {}->{}: {}",
+                                          local_addr, peer_addr, err);
+                                break 'main;
+                            }
                         }
                     }
                     Err(e) if e == TryRecvError::Empty => {
@@ -165,77 +240,88 @@ fn accept_connection(stream: TcpStream) -> (JoinHandle<io::Result<()>>, Sender<C
 
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = args().collect();
+    let mut should_mine = args.contains(&"--mine".to_string()) || args.contains(&"-m".to_string());
     let listen_addr_str = args.get(1).expect("You must supply a listen addr as arg1");
     let listener = TcpListener::bind(listen_addr_str).unwrap();
     listener.set_nonblocking(true).unwrap();
 
-    // let (main_sender, main_receiver) = channel();
+    let (main_sender, main_receiver) = channel();
 
     let (miner_jobs_sender, miner_jobs_receiver) = channel();
-    let (miner_results_sender, miner_results_receiver) = channel();
+    let miner_main_sender = main_sender.clone();
     let miner_thread = spawn(move || -> io::Result<()> {
+        let mut start_time = SystemTime::now();
+        let mut job_block = None;
+
         loop {
             match miner_jobs_receiver.try_recv() {
-                Ok(MinerJob { parent_block, .. }) => {
-                    let start_time = SystemTime::now();
-                    let parent_hash = parent_block.hash();
-                    let mut block = Block {
+                Ok(MinerMessage::Start(parent_block)) => {
+                    start_time = SystemTime::now();
+                    job_block = Some(Block {
                         miner_address: [0; 32],
-                        parent_hash,
+                        parent_hash: parent_block.hash(),
                         nonce: 0,
                         time: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
                         difficulty: parent_block.difficulty,
-                    };
-                    'mine: loop {
-                        for nonce in 0..u64::MAX {
+                    });
+                }
+                Ok(MinerMessage::Pause) => job_block = None,
+                Ok(MinerMessage::Quit) => break,
+                Err(TryRecvError::Empty) => {
+                    if let Some(mut block) = job_block {
+                        if let Some(nonce) = block.nonce.checked_add(1) {
                             block.nonce = nonce;
-                            if difficulty(block.hash()) >= parent_block.difficulty {
-                                break 'mine;
-                            }
+                        } else {
+                            // We ran out of nonce, bump the time and restart
+                            block.time = SystemTime::now().duration_since(UNIX_EPOCH)
+                                .unwrap().as_secs();
                         }
+                        job_block = Some(block);
 
-                        // We ran out of nonce, bump the time and restart
-                        block.time = SystemTime::now().duration_since(UNIX_EPOCH)
-                            .unwrap().as_secs();
-                    }
-                    let duration = start_time.elapsed().unwrap();
-                    // Artificially make the minimum mining time 5 seconds
-                    if let Some(duration) = Duration::from_secs(2).checked_sub(duration) {
-                        sleep(duration);
-                    }
-                    let seconds = duration.as_secs() % 60;
-                    let minutes = (duration.as_secs() / 60) % 60;
-                    let hours = (duration.as_secs() / 60) / 60;
-                    if hours > 0 {
-                        eprintln!("Mining took {} hour(s) {} minute(s) {} second(s)",
-                                  hours, minutes, seconds);
-                    } else if minutes > 0 {
-                        eprintln!("Mining took {} minute(s) {} second(s)", minutes, seconds);
+                        if difficulty(block.hash()) >= block.difficulty {
+                            let duration = start_time.elapsed().unwrap();
+                            // Artificially make the minimum mining time 5 seconds
+                            // if let Some(duration) = Duration::from_secs(2).checked_sub(duration) {
+                            //     sleep(duration);
+                            // }
+                            let seconds = duration.as_secs() % 60;
+                            let minutes = (duration.as_secs() / 60) % 60;
+                            let hours = (duration.as_secs() / 60) / 60;
+                            if hours > 0 {
+                                eprintln!("Mining took {} hour(s) {} minute(s) {} second(s)",
+                                          hours, minutes, seconds);
+                            } else if minutes > 0 {
+                                eprintln!("Mining took {} minute(s) {} second(s)", minutes, seconds);
+                            } else {
+                                eprintln!("Mining took {} second(s)", seconds);
+                            }
+
+                            miner_main_sender.send(NewBlock { block, from: None }).unwrap();
+                            job_block = None;
+                        }
                     } else {
-                        eprintln!("Mining took {} second(s)", seconds);
+                        // TODO: Replace with something smarter and OS dependant
+                        sleep(Duration::from_millis(10));
                     }
-
-                    miner_results_sender.send(block).unwrap();
                 }
-                Err(_) => {
-                    // TODO: Replace with something smarter and OS dependant
-                    sleep(Duration::from_millis(10));
-                }
+                Err(e) => panic!("{:?}", e),
             }
         }
 
-        // TODO: Ok(()), clean shutdown
+        Ok(())
     });
 
     let (server_sender, server_receiver) = channel();
+    let server_main_sender = main_sender.clone();
     let server_thread = spawn(move || -> io::Result<()> {
         let mut connection_threads = Vec::new();
 
         // Make outbound connections
         &args.get(2).map(|connect_addr_str| {
             eprintln!("Connecting to {}", connect_addr_str);
-            let mut stream = match TcpStream::connect(connect_addr_str) {
-                Ok(stream) => connection_threads.push(accept_connection(stream)),
+            let main_sender = server_main_sender.clone();
+            match TcpStream::connect(connect_addr_str) {
+                Ok(stream) => connection_threads.push(accept_connection(stream, main_sender)),
                 Err(error) => eprintln!("Failed to connect to {}: {}", connect_addr_str, error)
             };
         });
@@ -244,7 +330,8 @@ fn main() -> std::io::Result<()> {
         for stream in listener.incoming() {
             match stream {
                 Ok(stream) => {
-                    connection_threads.push(accept_connection(stream));
+                    let main_sender = server_main_sender.clone();
+                    connection_threads.push(accept_connection(stream, main_sender));
                 }
                 Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
                     match server_receiver.try_recv() {
@@ -262,6 +349,15 @@ fn main() -> std::io::Result<()> {
                             }
                             eprintln!("Quitting server thread {}", listener.local_addr().unwrap());
                             break;
+                        }
+                        Ok(ConnectionMessage::NewBlock(new_block)) => {
+                            connection_threads.retain(|(_, connection_sender)| {
+                                if let Err(_) = connection_sender.send(ConnectionMessage::NewBlock(new_block)) {
+                                    false
+                                } else {
+                                    true
+                                }
+                            });
                         }
                         Ok(ConnectionMessage::SendPing) => {
                             connection_threads.retain(|(_, connection_sender)| {
@@ -303,20 +399,28 @@ fn main() -> std::io::Result<()> {
         miner_address: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
         parent_hash: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
         nonce: 0,
-        time: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+        time: 1622999578, // SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
         difficulty: 2, // 2 gives results in 0-5 seconds, 3 gives results in 3-10 minutes
     };
 
-    let mut top_block = seed_block;
 
-    miner_jobs_sender.send(MinerJob { parent_block: top_block }).unwrap();
+    let mut blocks = Vec::new();
+    blocks.push(seed_block);
+
+    eprintln!("Seed block {}", blocks.last().unwrap());
+
+    if should_mine {
+        miner_jobs_sender.send(MinerMessage::Start(blocks.last().unwrap().clone())).unwrap();
+    }
 
     let mut terminal_input = true;
     let mut command = String::new();
     loop {
         if quit_requested.load(Ordering::SeqCst) {
             server_sender.send(ConnectionMessage::Quit).unwrap();
+            miner_jobs_sender.send(MinerMessage::Quit).unwrap();
             server_thread.join().unwrap().unwrap();
+            miner_thread.join().unwrap().unwrap();
             break;
         }
 
@@ -333,7 +437,10 @@ fn main() -> std::io::Result<()> {
                                 } else if command == "quit" || command == "q" {
                                     quit_requested.store(true, Ordering::SeqCst);
                                 } else if command == "mine" || command == "m" {
-                                    miner_jobs_sender.send(MinerJob { parent_block: top_block }).unwrap();
+                                    miner_jobs_sender.send(MinerMessage::Start(blocks.last().unwrap().clone())).unwrap();
+                                } else if command == "pause" || command == "p" {
+                                    miner_jobs_sender.send(MinerMessage::Pause).unwrap();
+                                    should_mine = false;
                                 }
                                 command.clear();
                             }
@@ -356,15 +463,23 @@ fn main() -> std::io::Result<()> {
         }
 
         loop {
-            match miner_results_receiver.try_recv() {
-                Ok(block) => {
-                    eprintln!("Mined {}", block);
-                    top_block = block;
-                    miner_jobs_sender.send(MinerJob { parent_block: top_block }).unwrap();
+            match main_receiver.try_recv() {
+                Ok(NewBlock { block, from }) => {
+                    let parent = blocks.last().unwrap();
+                    if block.parent_hash == parent.hash() &&
+                        block.difficulty == parent.difficulty {
+                        blocks.push(block);
+                        eprintln!("Inserting new block {}\nBlock height: {}", block, blocks.len());
+                        server_sender.send(ConnectionMessage::NewBlock(NewBlock { block, from })).unwrap();
+
+                        if should_mine {
+                            miner_jobs_sender.send(MinerMessage::Start(blocks.last().unwrap().clone())).unwrap();
+                        }
+                    } else {
+                        eprintln!("Discarding invalid block {}", block);
+                    }
                 }
-                Err(_) => {
-                    break;
-                }
+                Err(_) => break,
             }
         }
 
