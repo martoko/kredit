@@ -148,7 +148,7 @@ fn difficulty(hash: [u8; 32]) -> u8 {
     trailing_zeros
 }
 
-fn accept_connection(stream: TcpStream, main_sender: Sender<NewBlock>)
+fn accept_connection(stream: TcpStream, main_sender: Sender<NewBlock>, block_height: usize)
                      -> (JoinHandle<io::Result<()>>, Sender<ConnectionMessage>) {
     stream.set_nonblocking(true).unwrap();
     let peer_addr = stream.peer_addr().unwrap();
@@ -157,6 +157,23 @@ fn accept_connection(stream: TcpStream, main_sender: Sender<NewBlock>)
     let (connection_sender, connection_receiver) = channel();
     let connection_thread = spawn(move || -> io::Result<()> {
         let mut writer = BufWriter::new(&stream);
+
+        writer.write(&(block_height as u64).to_le_bytes()).unwrap();
+        writer.flush().unwrap();
+
+        let mut block_height_buffer = [0; 8];
+        loop {
+            match Read::read_exact(&mut (&stream), &mut block_height_buffer) {
+                Ok(()) => break,
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    // TODO: Replace with something smarter and OS dependant
+                    sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("error reading {:?}", error),
+            }
+        }
+        let other_block_height = u64::from_le_bytes(block_height_buffer);
+        eprintln!("Peer {} has block height {}, we have {}", peer_addr, other_block_height, block_height);
 
         'main: loop {
             let mut buffer = vec![0; 1];
@@ -239,6 +256,20 @@ fn accept_connection(stream: TcpStream, main_sender: Sender<NewBlock>)
 }
 
 fn main() -> std::io::Result<()> {
+    let quit_requested = Arc::new(AtomicBool::new(false));
+    {
+        let quit_requested = quit_requested.clone();
+        ctrlc::set_handler(move || {
+            if quit_requested.load(Ordering::SeqCst) {
+                eprintln!("\rExiting forcefully");
+                exit(1);
+            } else {
+                eprintln!("\rShutdown requested");
+                quit_requested.store(true, Ordering::SeqCst);
+            }
+        }).unwrap();
+    }
+
     let args: Vec<String> = args().collect();
     let mut should_mine = args.contains(&"--mine".to_string()) || args.contains(&"-m".to_string());
     let listen_addr_str = args.get(1).expect("You must supply a listen addr as arg1");
@@ -311,90 +342,6 @@ fn main() -> std::io::Result<()> {
         Ok(())
     });
 
-    let (server_sender, server_receiver) = channel();
-    let server_main_sender = main_sender.clone();
-    let server_thread = spawn(move || -> io::Result<()> {
-        let mut connection_threads = Vec::new();
-
-        // Make outbound connections
-        &args.get(2).map(|connect_addr_str| {
-            eprintln!("Connecting to {}", connect_addr_str);
-            let main_sender = server_main_sender.clone();
-            match TcpStream::connect(connect_addr_str) {
-                Ok(stream) => connection_threads.push(accept_connection(stream, main_sender)),
-                Err(error) => eprintln!("Failed to connect to {}: {}", connect_addr_str, error)
-            };
-        });
-
-        // Accept new inbound connections
-        for stream in listener.incoming() {
-            match stream {
-                Ok(stream) => {
-                    let main_sender = server_main_sender.clone();
-                    connection_threads.push(accept_connection(stream, main_sender));
-                }
-                Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
-                    match server_receiver.try_recv() {
-                        Ok(ConnectionMessage::Quit) => {
-                            connection_threads.retain(|(_, connection_sender)| {
-                                if let Err(_) = connection_sender.send(ConnectionMessage::Quit) {
-                                    false
-                                } else {
-                                    true
-                                }
-                            });
-
-                            while let Some((connection_thread, _)) = connection_threads.pop() {
-                                connection_thread.join().unwrap().unwrap();
-                            }
-                            eprintln!("Quitting server thread {}", listener.local_addr().unwrap());
-                            break;
-                        }
-                        Ok(ConnectionMessage::NewBlock(new_block)) => {
-                            connection_threads.retain(|(_, connection_sender)| {
-                                if let Err(_) = connection_sender.send(ConnectionMessage::NewBlock(new_block)) {
-                                    false
-                                } else {
-                                    true
-                                }
-                            });
-                        }
-                        Ok(ConnectionMessage::SendPing) => {
-                            connection_threads.retain(|(_, connection_sender)| {
-                                if let Err(_) = connection_sender.send(ConnectionMessage::SendPing) {
-                                    false
-                                } else {
-                                    true
-                                }
-                            });
-                        }
-                        Err(_) => {
-                            // TODO: Replace with something smarter and OS dependant
-                            sleep(Duration::from_millis(10));
-                        }
-                    }
-                }
-                Err(error) => eprintln!("Error when accepting listeners: {}", error),
-            }
-        }
-
-        Ok(())
-    });
-
-    let quit_requested = Arc::new(AtomicBool::new(false));
-    {
-        let quit_requested = quit_requested.clone();
-        ctrlc::set_handler(move || {
-            if quit_requested.load(Ordering::SeqCst) {
-                eprintln!("\rExiting forcefully");
-                exit(1);
-            } else {
-                eprintln!("\rShutdown requested");
-                quit_requested.store(true, Ordering::SeqCst);
-            }
-        }).unwrap();
-    }
-
     let seed_block = Block {
         miner_address: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
         parent_hash: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
@@ -407,6 +354,18 @@ fn main() -> std::io::Result<()> {
     let mut blocks = Vec::new();
     blocks.push(seed_block);
 
+    let mut connection_threads = Vec::new();
+
+    // Make outbound connections
+    &args.get(2).map(|connect_addr_str| {
+        eprintln!("Connecting to {}", connect_addr_str);
+        let main_sender = main_sender.clone();
+        match TcpStream::connect(connect_addr_str) {
+            Ok(stream) => connection_threads.push(accept_connection(stream, main_sender, blocks.len())),
+            Err(error) => eprintln!("Failed to connect to {}: {}", connect_addr_str, error)
+        };
+    });
+
     eprintln!("Seed block {}", blocks.last().unwrap());
 
     if should_mine {
@@ -417,11 +376,33 @@ fn main() -> std::io::Result<()> {
     let mut command = String::new();
     loop {
         if quit_requested.load(Ordering::SeqCst) {
-            server_sender.send(ConnectionMessage::Quit).unwrap();
             miner_jobs_sender.send(MinerMessage::Quit).unwrap();
-            server_thread.join().unwrap().unwrap();
             miner_thread.join().unwrap().unwrap();
+
+            connection_threads.retain(|(_, connection_sender)| {
+                if let Err(_) = connection_sender.send(ConnectionMessage::Quit) {
+                    false
+                } else {
+                    true
+                }
+            });
+
+            while let Some((connection_thread, _)) = connection_threads.pop() {
+                connection_thread.join().unwrap().unwrap();
+            }
             break;
+        }
+
+        match listener.accept() {
+            Ok((stream, _)) => {
+                let main_sender = main_sender.clone();
+                connection_threads.push(accept_connection(stream, main_sender, blocks.len()));
+            }
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                // TODO: Replace with something smarter and OS dependant
+                sleep(Duration::from_millis(10));
+            }
+            Err(error) => eprintln!("Error when accepting listeners: {}", error),
         }
 
         if terminal_input {
@@ -433,11 +414,18 @@ fn main() -> std::io::Result<()> {
                         match code {
                             crossterm::event::KeyCode::Enter => {
                                 if command == "ping" || command == "p" {
-                                    server_sender.send(ConnectionMessage::SendPing).unwrap();
+                                    connection_threads.retain(|(_, connection_sender)| {
+                                        if let Err(_) = connection_sender.send(ConnectionMessage::SendPing) {
+                                            false
+                                        } else {
+                                            true
+                                        }
+                                    });
                                 } else if command == "quit" || command == "q" {
                                     quit_requested.store(true, Ordering::SeqCst);
                                 } else if command == "mine" || command == "m" {
                                     miner_jobs_sender.send(MinerMessage::Start(blocks.last().unwrap().clone())).unwrap();
+                                    should_mine = true;
                                 } else if command == "pause" || command == "p" {
                                     miner_jobs_sender.send(MinerMessage::Pause).unwrap();
                                     should_mine = false;
@@ -470,7 +458,13 @@ fn main() -> std::io::Result<()> {
                         block.difficulty == parent.difficulty {
                         blocks.push(block);
                         eprintln!("Inserting new block {}\nBlock height: {}", block, blocks.len());
-                        server_sender.send(ConnectionMessage::NewBlock(NewBlock { block, from })).unwrap();
+                        connection_threads.retain(|(_, connection_sender)| {
+                            if let Err(_) = connection_sender.send(ConnectionMessage::NewBlock(NewBlock { block, from })) {
+                                false
+                            } else {
+                                true
+                            }
+                        });
 
                         if should_mine {
                             miner_jobs_sender.send(MinerMessage::Start(blocks.last().unwrap().clone())).unwrap();
