@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{time, fmt, io};
 use sha2::digest::generic_array::GenericArray;
 use sha2::digest::consts::{U64};
-use std::convert::TryInto;
+use std::convert::{TryInto, TryFrom};
 use std::fmt::{Display, Formatter};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::process::exit;
@@ -77,9 +77,25 @@ impl<'a> fmt::Display for Block<'a> {
 
 enum MessageType {
     Quit,
-    SendChat(String),
+    SendPing,
 }
 
+enum NetworkedMessageType {
+    Ping,
+    Pong,
+}
+
+impl TryFrom<u8> for NetworkedMessageType {
+    type Error = ();
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            x if x == NetworkedMessageType::Ping as u8 => Ok(NetworkedMessageType::Ping),
+            x if x == NetworkedMessageType::Pong as u8 => Ok(NetworkedMessageType::Pong),
+            _ => Err(()),
+        }
+    }
+}
 
 fn accept_connection(stream: TcpStream) -> (JoinHandle<io::Result<()>>, Sender<MessageType>) {
     stream.set_nonblocking(true).unwrap();
@@ -88,35 +104,64 @@ fn accept_connection(stream: TcpStream) -> (JoinHandle<io::Result<()>>, Sender<M
     println!("connection: them {}, us {}", peer_addr, local_addr);
     let (connection_sender, connection_receiver) = channel();
     let connection_thread = spawn(move || -> io::Result<()> {
-        let mut reader = BufReader::new(&stream);
         let mut writer = BufWriter::new(&stream);
 
-        writer.write_fmt(format_args!("Hello, {}!\n", peer_addr))
-            .unwrap();
-        writer.flush().unwrap();
-
-        loop {
-            // match connection_receiver.try_recv() {
-            match connection_receiver.recv() {
-                Ok(MessageType::Quit) => {
-                    eprintln!("Quitting connection thread {}->{}", local_addr, peer_addr);
-                    break;
-                }
-                Ok(MessageType::SendChat(text)) => {
-                    write!(&mut writer, "[{}] {}\n", peer_addr, text).unwrap();
-
-                    if let Err(err) = writer.flush() {
-                        eprintln!("Connection closed {}->{}: {}",
-                                  local_addr, peer_addr, err);
-                        break;
+        'main: loop {
+            let mut buffer = vec![0; 1024];
+            'stream_events: loop {
+                match Read::read(&mut (&stream), &mut buffer) {
+                    Ok(0) => {
+                        // connection closed
+                        break 'stream_events;
+                    }
+                    Ok(count) => {
+                        match buffer[0].try_into() {
+                            Ok(NetworkedMessageType::Ping) => {
+                                eprintln!("Ping!");
+                                writer.write(&[NetworkedMessageType::Pong as u8]).unwrap();
+                                writer.flush().unwrap();
+                            }
+                            Ok(NetworkedMessageType::Pong) => {
+                                eprintln!("Pong!");
+                            }
+                            Err(e) => {
+                                eprintln!("Received invalid message type {}", buffer[0]);
+                                break 'main;
+                            }
+                        }
+                    }
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        break 'stream_events;
+                    }
+                    Err(error) => {
+                        panic!("error reading {:?}", error);
                     }
                 }
-                // Err(e) if e == TryRecvError::Empty => {
-                //     // TODO: Replace with something smarter and OS dependant
-                //     sleep(Duration::from_millis(10));
-                // }
-                Err(e) => panic!("{}", e),
             }
+
+            'channel_events: loop {
+                match connection_receiver.try_recv() {
+                    Ok(MessageType::Quit) => {
+                        eprintln!("Quitting connection thread {}->{}", local_addr, peer_addr);
+                        break 'main;
+                    }
+                    Ok(MessageType::SendPing) => {
+                        writer.write(&[NetworkedMessageType::Ping as u8]).unwrap();
+                        if let Err(err) = writer.flush() {
+                            eprintln!("Connection closed {}->{}: {}",
+                                      local_addr, peer_addr, err);
+                            break;
+                        }
+                    }
+                    Err(e) if e == TryRecvError::Empty => {
+                        break 'channel_events;
+                    }
+                    Err(e) => panic!("{}", e),
+                }
+            }
+
+            // TODO: Replace with something smarter and OS dependant
+            sleep(Duration::from_millis(10));
         }
 
         Ok(())
@@ -189,9 +234,9 @@ fn main() -> std::io::Result<()> {
                             eprintln!("Quitting server thread {}", listener.local_addr().unwrap());
                             break;
                         }
-                        Ok(MessageType::SendChat(text)) => {
+                        Ok(MessageType::SendPing) => {
                             connection_threads.retain(|(_, connection_sender)| {
-                                if let Err(_) = connection_sender.send(MessageType::SendChat(text.clone())) {
+                                if let Err(_) = connection_sender.send(MessageType::SendPing) {
                                     false
                                 } else {
                                     true
@@ -225,29 +270,38 @@ fn main() -> std::io::Result<()> {
         }).unwrap();
     }
 
+    let mut terminal_input = true;
     loop {
         if quit_requested.load(Ordering::SeqCst) {
-            server_sender.send(MessageType::SendChat("Bye".to_string())).unwrap();
             server_sender.send(MessageType::Quit).unwrap();
             server_thread.join().unwrap().unwrap();
             break;
         }
 
-        match crossterm::event::poll(Duration::from_secs(0)).unwrap() {
-            true => {
-                // It's guaranteed that read() wont block if `poll` returns `Ok(true)`
-                let command = read_line().unwrap();
+        if terminal_input {
+            match crossterm::event::poll(Duration::from_secs(0)) {
+                Ok(true) => {
+                    // It's guaranteed that read() wont block if `poll` returns `Ok(true)`
+                    let command = read_line().unwrap();
 
-                if command == "ping" || command == "p" {
-                    server_sender.send(MessageType::SendChat("ping".to_string())).unwrap();
-                } else if command == "quit" || command == "q" {
-                    quit_requested.store(true, Ordering::SeqCst);
+                    if command == "ping" || command == "p" {
+                        server_sender.send(MessageType::SendPing).unwrap();
+                    } else if command == "quit" || command == "q" {
+                        quit_requested.store(true, Ordering::SeqCst);
+                    }
+                }
+                Ok(false) => {
+                    // TODO: Replace with something smarter and OS dependant
+                    sleep(Duration::from_millis(10));
+                }
+                Err(error) => {
+                    eprintln!("Failed to read from terminal, commands disabled: {:?}", error);
+                    terminal_input = false;
                 }
             }
-            false => {
-                // TODO: Replace with something smarter and OS dependant
-                sleep(Duration::from_millis(10));
-            }
+        } else {
+            // TODO: Replace with something smarter and OS dependant
+            sleep(Duration::from_millis(10));
         }
     }
 
