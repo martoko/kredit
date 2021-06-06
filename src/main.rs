@@ -19,63 +19,43 @@ use std::fmt::{Display, Formatter};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::process::exit;
 
-fn hashing() {
-    let a = Block {
-        miner_address: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-        parent_hash: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-        nonce: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-        time: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
-        difficulty: 1,
-        parent: None,
-    };
-    sleep(Duration::from_secs(1));
-    let b = Block {
-        miner_address: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-        parent_hash: a.hash(),
-        nonce: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-        time: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
-        difficulty: 1,
-        parent: Some(&a),
-    };
-    eprintln!("{}", hex::encode(a.hash()));
-    eprintln!("{}", a);
-    eprintln!("{}", b);
-}
-
-struct Block<'a> {
+#[derive(Debug, Copy, Clone)]
+struct Block {
     parent_hash: [u8; 32],
     miner_address: [u8; 32],
-    nonce: [u8; 32],
-    difficulty: u64,
+    nonce: u64,
+    difficulty: u8,
     time: u64,
-
-    parent: Option<&'a Block<'a>>,
 }
 
-impl<'a> Block<'a> {
+impl Block {
     fn hash(&self) -> [u8; 32] {
         let mut sha256 = Sha256::new();
         sha256.update(self.parent_hash);
         sha256.update(self.miner_address);
-        sha256.update(self.nonce);
+        sha256.update(self.nonce.to_le_bytes());
         sha256.update(self.difficulty.to_le_bytes());
         sha256.update(self.time.to_le_bytes());
         sha256.finalize().into()
     }
 }
 
-impl<'a> fmt::Display for Block<'a> {
+impl fmt::Display for Block {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "({}, {}, {}, {}, {})",
+        write!(f, "{{\nhash: {},\nparent_hash: {},\nminer_address: {},\nnonce: {},\ntime: {}\n}}",
                hex::encode(self.hash()),
                hex::encode(self.parent_hash),
                hex::encode(self.miner_address),
-               hex::encode(self.nonce),
+               hex::encode(self.nonce.to_le_bytes()),
                self.time)
     }
 }
 
-enum MessageType {
+struct MinerJob {
+    parent_block: Block,
+}
+
+enum ConnectionMessage {
     Quit,
     SendPing,
 }
@@ -97,7 +77,20 @@ impl TryFrom<u8> for NetworkedMessageType {
     }
 }
 
-fn accept_connection(stream: TcpStream) -> (JoinHandle<io::Result<()>>, Sender<MessageType>) {
+fn difficulty(hash: [u8; 32]) -> u8 {
+    let mut trailing_zeros = 0;
+    for i in (0..32).rev() {
+        if hash[i] == 0 {
+            trailing_zeros += 1;
+        } else {
+            break;
+        }
+    }
+
+    trailing_zeros
+}
+
+fn accept_connection(stream: TcpStream) -> (JoinHandle<io::Result<()>>, Sender<ConnectionMessage>) {
     stream.set_nonblocking(true).unwrap();
     let peer_addr = stream.peer_addr().unwrap();
     let local_addr = stream.local_addr().unwrap();
@@ -141,11 +134,11 @@ fn accept_connection(stream: TcpStream) -> (JoinHandle<io::Result<()>>, Sender<M
 
             'channel_events: loop {
                 match connection_receiver.try_recv() {
-                    Ok(MessageType::Quit) => {
+                    Ok(ConnectionMessage::Quit) => {
                         eprintln!("Quitting connection thread {}->{}", local_addr, peer_addr);
                         break 'main;
                     }
-                    Ok(MessageType::SendPing) => {
+                    Ok(ConnectionMessage::SendPing) => {
                         writer.write(&[NetworkedMessageType::Ping as u8]).unwrap();
                         if let Err(err) = writer.flush() {
                             eprintln!("Connection closed {}->{}: {}",
@@ -171,8 +164,6 @@ fn accept_connection(stream: TcpStream) -> (JoinHandle<io::Result<()>>, Sender<M
 }
 
 fn main() -> std::io::Result<()> {
-    hashing();
-
     let args: Vec<String> = args().collect();
     let listen_addr_str = args.get(1).expect("You must supply a listen addr as arg1");
     let listener = TcpListener::bind(listen_addr_str).unwrap();
@@ -180,8 +171,56 @@ fn main() -> std::io::Result<()> {
 
     // let (main_sender, main_receiver) = channel();
 
+    let (miner_jobs_sender, miner_jobs_receiver) = channel();
+    let (miner_results_sender, miner_results_receiver) = channel();
+    let miner_thread = spawn(move || -> io::Result<()> {
+        loop {
+            match miner_jobs_receiver.try_recv() {
+                Ok(MinerJob { parent_block, .. }) => {
+                    let start_time = SystemTime::now();
+                    let parent_hash = parent_block.hash();
+                    let mut block = Block {
+                        miner_address: [0; 32],
+                        parent_hash,
+                        nonce: 0,
+                        time: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+                        difficulty: parent_block.difficulty,
+                    };
+                    while difficulty(block.hash()) < parent_block.difficulty {
+                        match block.nonce.checked_add(1) {
+                            Some(nonce) => block.nonce = nonce,
+                            None => {
+                                block.time = SystemTime::now().duration_since(UNIX_EPOCH)
+                                    .unwrap().as_secs();
+                            }
+                        }
+                    }
+                    let duration = start_time.elapsed().unwrap();
+                    let seconds = duration.as_secs() % 60;
+                    let minutes = (duration.as_secs() / 60) % 60;
+                    let hours = (duration.as_secs() / 60) / 60;
+                    if hours > 0 {
+                        eprintln!("Mining took {} hour(s) {} minute(s) {} second(s)",
+                                  hours, minutes, seconds);
+                    } else if minutes > 0 {
+                        eprintln!("Mining took {} minute(s) {} second(s)", minutes, seconds);
+                    } else {
+                        eprintln!("Mining took {} second(s)", seconds);
+                    }
+                    miner_results_sender.send(block).unwrap();
+                }
+                Err(_) => {
+                    // TODO: Replace with something smarter and OS dependant
+                    sleep(Duration::from_millis(10));
+                }
+            }
+        }
+
+        // TODO: Ok(()), clean shutdown
+    });
+
     let (server_sender, server_receiver) = channel();
-    let server_thread = spawn(move || -> std::io::Result<()> {
+    let server_thread = spawn(move || -> io::Result<()> {
         let mut connection_threads = Vec::new();
 
         // Make outbound connections
@@ -201,9 +240,9 @@ fn main() -> std::io::Result<()> {
                 }
                 Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
                     match server_receiver.try_recv() {
-                        Ok(MessageType::Quit) => {
+                        Ok(ConnectionMessage::Quit) => {
                             connection_threads.retain(|(_, connection_sender)| {
-                                if let Err(_) = connection_sender.send(MessageType::Quit) {
+                                if let Err(_) = connection_sender.send(ConnectionMessage::Quit) {
                                     false
                                 } else {
                                     true
@@ -216,9 +255,9 @@ fn main() -> std::io::Result<()> {
                             eprintln!("Quitting server thread {}", listener.local_addr().unwrap());
                             break;
                         }
-                        Ok(MessageType::SendPing) => {
+                        Ok(ConnectionMessage::SendPing) => {
                             connection_threads.retain(|(_, connection_sender)| {
-                                if let Err(_) = connection_sender.send(MessageType::SendPing) {
+                                if let Err(_) = connection_sender.send(ConnectionMessage::SendPing) {
                                     false
                                 } else {
                                     true
@@ -252,11 +291,23 @@ fn main() -> std::io::Result<()> {
         }).unwrap();
     }
 
+    let seed_block = Block {
+        miner_address: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        parent_hash: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        nonce: 0,
+        time: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+        difficulty: 2,
+    };
+
+    let mut top_block = seed_block;
+
+    miner_jobs_sender.send(MinerJob { parent_block: top_block }).unwrap();
+
     let mut terminal_input = true;
     let mut command = String::new();
     loop {
         if quit_requested.load(Ordering::SeqCst) {
-            server_sender.send(MessageType::Quit).unwrap();
+            server_sender.send(ConnectionMessage::Quit).unwrap();
             server_thread.join().unwrap().unwrap();
             break;
         }
@@ -270,9 +321,11 @@ fn main() -> std::io::Result<()> {
                         match code {
                             crossterm::event::KeyCode::Enter => {
                                 if command == "ping" || command == "p" {
-                                    server_sender.send(MessageType::SendPing).unwrap();
+                                    server_sender.send(ConnectionMessage::SendPing).unwrap();
                                 } else if command == "quit" || command == "q" {
                                     quit_requested.store(true, Ordering::SeqCst);
+                                } else if command == "mine" || command == "m" {
+                                    miner_jobs_sender.send(MinerJob { parent_block: top_block }).unwrap();
                                 }
                                 command.clear();
                             }
@@ -292,10 +345,23 @@ fn main() -> std::io::Result<()> {
                     terminal_input = false;
                 }
             }
-        } else {
-            // TODO: Replace with something smarter and OS dependant
-            sleep(Duration::from_millis(10));
         }
+
+        loop {
+            match miner_results_receiver.try_recv() {
+                Ok(block) => {
+                    eprintln!("Mined {}", block);
+                    top_block = block;
+                    miner_jobs_sender.send(MinerJob { parent_block: top_block }).unwrap();
+                }
+                Err(_) => {
+                    break;
+                }
+            }
+        }
+
+        // TODO: Replace with something smarter and OS dependant
+        sleep(Duration::from_millis(10));
     }
 
     Ok(())
