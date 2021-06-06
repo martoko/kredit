@@ -186,16 +186,23 @@ fn main() -> std::io::Result<()> {
                         time: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
                         difficulty: parent_block.difficulty,
                     };
-                    while difficulty(block.hash()) < parent_block.difficulty {
-                        match block.nonce.checked_add(1) {
-                            Some(nonce) => block.nonce = nonce,
-                            None => {
-                                block.time = SystemTime::now().duration_since(UNIX_EPOCH)
-                                    .unwrap().as_secs();
+                    'mine: loop {
+                        for nonce in 0..u64::MAX {
+                            block.nonce = nonce;
+                            if difficulty(block.hash()) >= parent_block.difficulty {
+                                break 'mine;
                             }
                         }
+
+                        // We ran out of nonce, bump the time and restart
+                        block.time = SystemTime::now().duration_since(UNIX_EPOCH)
+                            .unwrap().as_secs();
                     }
                     let duration = start_time.elapsed().unwrap();
+                    // Artificially make the minimum mining time 5 seconds
+                    if let Some(duration) = Duration::from_secs(2).checked_sub(duration) {
+                        sleep(duration);
+                    }
                     let seconds = duration.as_secs() % 60;
                     let minutes = (duration.as_secs() / 60) % 60;
                     let hours = (duration.as_secs() / 60) / 60;
@@ -207,6 +214,7 @@ fn main() -> std::io::Result<()> {
                     } else {
                         eprintln!("Mining took {} second(s)", seconds);
                     }
+
                     miner_results_sender.send(block).unwrap();
                 }
                 Err(_) => {
@@ -296,7 +304,7 @@ fn main() -> std::io::Result<()> {
         parent_hash: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
         nonce: 0,
         time: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
-        difficulty: 2,
+        difficulty: 2, // 2 gives results in 0-5 seconds, 3 gives results in 3-10 minutes
     };
 
     let mut top_block = seed_block;
