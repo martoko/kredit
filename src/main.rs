@@ -3,7 +3,7 @@ use std::convert::TryInto;
 use std::env::args;
 use std::fmt;
 use std::io::{BufWriter, ErrorKind, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::process::exit;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -69,9 +69,9 @@ enum ToPeer {
 #[derive(Debug, Clone)]
 enum ToNode {
     Quit,
-    Received(NetworkedMessage, Sender<ToPeer>),
+    Received(NetworkedMessage, SocketAddr),
     Mined(Block),
-    ConnectionEstablished(Sender<ToPeer>),
+    ConnectionEstablished(SocketAddr),
 }
 
 #[derive(Debug)]
@@ -93,7 +93,7 @@ enum NetworkedMessage {
     Block(Block),
     Ping,
     Pong,
-    BlockHeight(u64),
+    TopBlockHash([u8; 32]),
 }
 
 impl NetworkedMessage {
@@ -118,11 +118,11 @@ impl NetworkedMessage {
                 }))
             }
             3 => {
-                let mut buffer = [0; 8];
+                let mut buffer = [0; 32];
                 stream.set_nonblocking(false)?;
                 (&mut (&*stream)).read(&mut buffer)?;
                 stream.set_nonblocking(true)?;
-                Ok(NetworkedMessage::BlockHeight(u64::from_le_bytes(buffer)))
+                Ok(NetworkedMessage::TopBlockHash(buffer))
             }
             _ => Err(DeserializeError::from(io::Error::new(
                 ErrorKind::InvalidData, format!("Invalid message type: {}", r#type), // TODO: Bad error style
@@ -154,17 +154,17 @@ fn difficulty(hash: [u8; 32]) -> u8 {
 //
 // Another interesting task: Persisting the blockchain on shutdown, maybe also some peers?
 
-fn accept_connection(stream: TcpStream, node_sender: Sender<ToNode>) -> (JoinHandle<io::Result<()>>, Sender<ToPeer>) {
+fn accept_connection(stream: TcpStream, node_sender: Sender<ToNode>)
+                     -> (SocketAddr, JoinHandle<io::Result<()>>, Sender<ToPeer>) {
     stream.set_nonblocking(true).unwrap();
     let peer_addr = stream.peer_addr().unwrap();
     let local_addr = stream.local_addr().unwrap();
-    println!("connection: them {}, us {}", peer_addr, local_addr);
+    eprintln!("connection: them {}, us {}", peer_addr, local_addr);
     let (connection_sender, connection_receiver) = channel();
-    let connection_sender_for_thread = connection_sender.clone(); // TODO: Id's/peer_addr instead?
     let connection_thread = spawn(move || -> io::Result<()> {
         let mut writer = BufWriter::new(&stream);
 
-        node_sender.send(ToNode::ConnectionEstablished(connection_sender_for_thread.clone())).unwrap();
+        node_sender.send(ToNode::ConnectionEstablished(peer_addr)).unwrap();
 
         'main: loop {
             let mut buffer = vec![0; 1];
@@ -176,8 +176,7 @@ fn accept_connection(stream: TcpStream, node_sender: Sender<ToNode>) -> (JoinHan
                     }
                     Ok(1) => {
                         let message = NetworkedMessage::receive(&stream, buffer[0]).unwrap();
-                        node_sender.send(ToNode::Received(message, connection_sender_for_thread
-                            .clone())).unwrap();  // TODO: Id's/peer_addr instead?
+                        node_sender.send(ToNode::Received(message, peer_addr)).unwrap();
                     }
                     Ok(count) => panic!("Impossible amount of bytes read {}", count),
                     Err(error) if error.kind() == ErrorKind::WouldBlock => {
@@ -224,9 +223,9 @@ fn accept_connection(stream: TcpStream, node_sender: Sender<ToNode>) -> (JoinHan
                             break 'main;
                         }
                     }
-                    Ok(ToPeer::Send(NetworkedMessage::BlockHeight(block_height))) => {
+                    Ok(ToPeer::Send(NetworkedMessage::TopBlockHash(block_hash))) => {
                         writer.write(&[3]).unwrap();
-                        writer.write(&block_height.to_le_bytes()).unwrap();
+                        writer.write(&block_hash).unwrap();
                         if let Err(err) = writer.flush() {
                             eprintln!("Connection closed {}->{}: {}",
                                       local_addr, peer_addr, err);
@@ -247,7 +246,7 @@ fn accept_connection(stream: TcpStream, node_sender: Sender<ToNode>) -> (JoinHan
         Ok(())
     });
 
-    (connection_thread, connection_sender)
+    (peer_addr, connection_thread, connection_sender)
 }
 
 fn main() -> std::io::Result<()> {
@@ -351,19 +350,20 @@ fn main() -> std::io::Result<()> {
     let mut blocks = Vec::new();
     blocks.push(seed_block);
 
-    let mut connection_threads = Vec::new();
+    let mut connections = Vec::new();
 
     // Make outbound connections
-    &args.get(2).map(|connect_addr_str| {
-        eprintln!("Connecting to {}", connect_addr_str);
+
+    for arg in &args[2..] {
+        eprintln!("Connecting to {}", arg);
         let node_sender = node_sender.clone();
-        match TcpStream::connect(connect_addr_str) {
-            Ok(stream) => connection_threads.push(
+        match TcpStream::connect(arg) {
+            Ok(stream) => connections.push(
                 accept_connection(stream, node_sender)
             ),
-            Err(error) => eprintln!("Failed to connect to {}: {}", connect_addr_str, error)
+            Err(error) => eprintln!("Failed to connect to {}: {}", arg, error)
         };
-    });
+    }
 
     eprintln!("Seed block {}", blocks.last().unwrap());
 
@@ -377,9 +377,7 @@ fn main() -> std::io::Result<()> {
         match listener.accept() {
             Ok((stream, _)) => {
                 let main_sender = node_sender.clone();
-                connection_threads.push(
-                    accept_connection(stream, main_sender)
-                );
+                connections.push(accept_connection(stream, main_sender));
             }
             Err(e) if e.kind() == ErrorKind::WouldBlock => {
                 // TODO: Replace with something smarter and OS dependant
@@ -397,7 +395,7 @@ fn main() -> std::io::Result<()> {
                         match code {
                             crossterm::event::KeyCode::Enter => {
                                 if command == "ping" || command == "p" {
-                                    connection_threads.retain(|(_, connection_sender)| {
+                                    connections.retain(|(_, _, connection_sender)| {
                                         if let Err(_) = connection_sender.send(ToPeer::Send(NetworkedMessage::Ping)) {
                                             false
                                         } else {
@@ -435,20 +433,26 @@ fn main() -> std::io::Result<()> {
 
         loop {
             match node_receiver.try_recv() {
-                Ok(ToNode::Received(NetworkedMessage::Ping, peer_sender)) => {
+                Ok(ToNode::Received(NetworkedMessage::Ping, from)) => {
                     eprintln!("Ping!");
-                    peer_sender.send(ToPeer::Send(NetworkedMessage::Pong)).unwrap();
+                    for (addr, _thread, connection_sender) in &connections {
+                        if *addr == from {
+                            connection_sender.send(ToPeer::Send(NetworkedMessage::Pong)).unwrap();
+                        }
+                    }
                 }
                 Ok(ToNode::Received(NetworkedMessage::Pong, _)) => {
                     eprintln!("Pong!");
                 }
-                Ok(ToNode::Received(NetworkedMessage::Block(block), _)) => {
+                Ok(ToNode::Received(NetworkedMessage::Block(block), from)) => {
                     let parent = blocks.last().unwrap();
                     if block.parent_hash == parent.hash() &&
                         block.difficulty == parent.difficulty {
                         blocks.push(block);
                         eprintln!("Inserting new block {}\nBlock height: {}", block, blocks.len());
-                        connection_threads.retain(|(_, connection_sender)| {
+                        connections.retain(|(addr, _, connection_sender)| {
+                            if *addr == from { return true; }
+
                             if let Err(_) = connection_sender.send(ToPeer::Send(NetworkedMessage::Block(block))) {
                                 false
                             } else {
@@ -456,11 +460,35 @@ fn main() -> std::io::Result<()> {
                             }
                         });
 
+                        for (addr, _, connection_sender) in &connections {
+                            if *addr == from {
+                                connection_sender.send(ToPeer::Send(
+                                    NetworkedMessage::TopBlockHash(blocks.last().unwrap().hash())
+                                )).unwrap();
+                            }
+                        }
+
                         if should_mine {
                             miner_sender.send(ToMiner::Start(blocks.last().unwrap().clone())).unwrap();
                         }
                     } else {
-                        eprintln!("Discarding invalid block {}", block);
+                        eprintln!("Discarding invalid block {}, block height {}", block, blocks
+                            .len());
+                    }
+                }
+                Ok(ToNode::Received(NetworkedMessage::TopBlockHash(block_hash), from)) => {
+                    eprintln!("peer has block top: {}", hex::encode(block_hash));
+                    for block in &blocks {
+                        if block.parent_hash == block_hash {
+                            for (addr, _, connection_sender) in &connections {
+                                if *addr == from {
+                                    connection_sender.send(ToPeer::Send(
+                                        NetworkedMessage::Block(*block)
+                                    )).unwrap();
+                                }
+                            }
+                            break;
+                        }
                     }
                 }
                 Ok(ToNode::Mined(block)) => {
@@ -469,7 +497,7 @@ fn main() -> std::io::Result<()> {
                         block.difficulty == parent.difficulty {
                         blocks.push(block);
                         eprintln!("Inserting new block {}\nBlock height: {}", block, blocks.len());
-                        connection_threads.retain(|(_, connection_sender)| {
+                        connections.retain(|(_, _, connection_sender)| {
                             if let Err(_) = connection_sender.send(ToPeer::Send(NetworkedMessage::Block(block))) {
                                 false
                             } else {
@@ -484,19 +512,20 @@ fn main() -> std::io::Result<()> {
                         eprintln!("Discarding invalid block {}", block);
                     }
                 }
-                Ok(ToNode::Received(NetworkedMessage::BlockHeight(block_height), _)) => {
-                    eprintln!("peer has block height: {}", block_height);
-                }
-                Ok(ToNode::ConnectionEstablished(peer_sender)) => {
-                    peer_sender.send(ToPeer::Send(NetworkedMessage::BlockHeight(
-                        blocks.len() as u64
-                    ))).unwrap();
+                Ok(ToNode::ConnectionEstablished(connected_addr)) => {
+                    for (addr, _, connection_sender) in &connections {
+                        if *addr == connected_addr {
+                            connection_sender.send(ToPeer::Send(NetworkedMessage::TopBlockHash(
+                                blocks.last().unwrap().hash()
+                            ))).unwrap();
+                        }
+                    }
                 }
                 Ok(ToNode::Quit) => {
                     miner_sender.send(ToMiner::Quit).unwrap();
                     miner_thread.join().unwrap().unwrap();
 
-                    connection_threads.retain(|(_, connection_sender)| {
+                    connections.retain(|(_, _, connection_sender)| {
                         if let Err(_) = connection_sender.send(ToPeer::Quit) {
                             false
                         } else {
@@ -504,7 +533,7 @@ fn main() -> std::io::Result<()> {
                         }
                     });
 
-                    while let Some((connection_thread, _)) = connection_threads.pop() {
+                    while let Some((_, connection_thread, _)) = connections.pop() {
                         connection_thread.join().unwrap().unwrap();
                     }
                     break 'outer;
