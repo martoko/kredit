@@ -122,6 +122,12 @@ enum NetworkedMessageType {
     Block,
 }
 
+#[derive(Debug, Clone)]
+struct Peer {
+    addr: SocketAddr,
+    block_height: Arc<RwLock<u64>>,
+}
+
 impl TryFrom<u8> for NetworkedMessageType {
     type Error = ();
 
@@ -148,17 +154,31 @@ fn difficulty(hash: [u8; 32]) -> u8 {
     trailing_zeros
 }
 
-fn accept_connection(stream: TcpStream, main_sender: Sender<NewBlock>, block_height: usize)
-                     -> (JoinHandle<io::Result<()>>, Sender<ConnectionMessage>) {
+// TODO: Introduce phases
+// Phase 1, seed peers
+//   For now just rely on the user specifying exact IP's
+//   In the future the nodes should exchange peers with each other
+// Phase 2, synchronize blockchain
+//   Maybe just choose a node and ask it to send a full history
+// Phase 3, maintain the blockchain & mine
+//
+// Another interesting task: Persisting the blockchain on shutdown, maybe also some peers?
+
+fn accept_connection(stream: TcpStream, main_sender: Sender<NewBlock>)
+                     -> (JoinHandle<io::Result<()>>, Sender<ConnectionMessage>, Peer) {
     stream.set_nonblocking(true).unwrap();
     let peer_addr = stream.peer_addr().unwrap();
     let local_addr = stream.local_addr().unwrap();
     println!("connection: them {}, us {}", peer_addr, local_addr);
+    let peer = Peer {
+        addr: peer_addr,
+        block_height: Arc::new(RwLock::new(0)),
+    };
     let (connection_sender, connection_receiver) = channel();
     let connection_thread = spawn(move || -> io::Result<()> {
         let mut writer = BufWriter::new(&stream);
 
-        writer.write(&(block_height as u64).to_le_bytes()).unwrap();
+        writer.write(&block_height.to_le_bytes()).unwrap();
         writer.flush().unwrap();
 
         let mut block_height_buffer = [0; 8];
@@ -172,8 +192,12 @@ fn accept_connection(stream: TcpStream, main_sender: Sender<NewBlock>, block_hei
                 Err(error) => panic!("error reading {:?}", error),
             }
         }
-        let other_block_height = u64::from_le_bytes(block_height_buffer);
-        eprintln!("Peer {} has block height {}, we have {}", peer_addr, other_block_height, block_height);
+        let peer_block_height = u64::from_le_bytes(block_height_buffer);
+        {
+            let mut write = peer.block_height.write().unwrap();
+            *write = peer_block_height;
+        }
+        eprintln!("Peer {} has block height {}", peer_addr, peer_block_height);
 
         'main: loop {
             let mut buffer = vec![0; 1];
@@ -252,7 +276,7 @@ fn accept_connection(stream: TcpStream, main_sender: Sender<NewBlock>, block_hei
         Ok(())
     });
 
-    (connection_thread, connection_sender)
+    (connection_thread, connection_sender, peer)
 }
 
 fn main() -> std::io::Result<()> {
@@ -361,7 +385,9 @@ fn main() -> std::io::Result<()> {
         eprintln!("Connecting to {}", connect_addr_str);
         let main_sender = main_sender.clone();
         match TcpStream::connect(connect_addr_str) {
-            Ok(stream) => connection_threads.push(accept_connection(stream, main_sender, blocks.len())),
+            Ok(stream) => connection_threads.push(
+                accept_connection(stream, main_sender)
+            ),
             Err(error) => eprintln!("Failed to connect to {}: {}", connect_addr_str, error)
         };
     });
@@ -396,7 +422,9 @@ fn main() -> std::io::Result<()> {
         match listener.accept() {
             Ok((stream, _)) => {
                 let main_sender = main_sender.clone();
-                connection_threads.push(accept_connection(stream, main_sender, blocks.len()));
+                connection_threads.push(
+                    accept_connection(stream, main_sender)
+                );
             }
             Err(e) if e.kind() == ErrorKind::WouldBlock => {
                 // TODO: Replace with something smarter and OS dependant
