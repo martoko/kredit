@@ -1,24 +1,17 @@
-#![allow(unused_imports)]
-
-use std::net::{TcpListener, TcpStream, SocketAddr};
-use std::str::FromStr;
-use std::sync::mpsc::{Sender, Receiver, channel, TryRecvError, SendError};
-use std::sync::{mpsc, Arc, RwLock};
-use std::thread::{spawn, sleep, JoinHandle};
-use std::io::{Write, BufRead, BufReader, BufWriter, Read, stdin, stdout, ErrorKind};
-use std::error::Error;
-use sha2::{Sha512, Digest, Sha256};
-use hex::ToHex;
+use std::{array, io};
+use std::convert::TryInto;
 use std::env::args;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use std::{time, fmt, io};
-use sha2::digest::generic_array::GenericArray;
-use sha2::digest::consts::{U64};
-use std::convert::{TryInto, TryFrom};
-use std::fmt::{Display, Formatter};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::fmt;
+use std::io::{BufWriter, ErrorKind, Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::process::exit;
-use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{channel, Sender, TryRecvError};
+use std::thread::{JoinHandle, sleep, spawn};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, Copy, Clone)]
 struct Block {
@@ -38,41 +31,6 @@ impl Block {
         sha256.update(self.difficulty.to_le_bytes());
         sha256.update(self.time.to_le_bytes());
         sha256.finalize().into()
-    }
-
-    fn deserialize(reader: &mut dyn Read) -> io::Result<Block> {
-        let mut buffer = [0; 32 + 32 + 8 + 1 + 8];
-        let mut bytes_read = 0;
-        while bytes_read < buffer.len() {
-            match reader.read(&mut buffer[bytes_read..]) {
-                Ok(x) => bytes_read += x,
-                Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                    eprintln!("Have read this so far {:?}", buffer);
-                    eprintln!("Would block, waiting...");
-                    // TODO: Replace with something smarter and OS dependant
-                    sleep(Duration::from_millis(10));
-                }
-                Err(e) => return Err(e),
-            };
-        }
-
-        Ok(Block {
-            parent_hash: buffer[0..32].try_into().unwrap(),
-            miner_address: buffer[32..64].try_into().unwrap(),
-            nonce: u64::from_le_bytes(buffer[64..72].try_into().unwrap()),
-            difficulty: buffer[72].try_into().unwrap(),
-            time: u64::from_le_bytes(buffer[73..81].try_into().unwrap()),
-        })
-    }
-
-    fn serialize(&self, writer: &mut dyn Write) {
-        let mut buffer = vec![0; 0];
-        for byte in self.parent_hash { buffer.push(byte); }
-        for byte in self.miner_address { buffer.push(byte); }
-        for byte in self.nonce.to_le_bytes() { buffer.push(byte); }
-        for byte in self.difficulty.to_le_bytes() { buffer.push(byte); }
-        for byte in self.time.to_le_bytes() { buffer.push(byte); }
-        writer.write_all(&buffer).unwrap();
     }
 }
 
@@ -96,47 +54,79 @@ impl fmt::Display for Block {
 }
 
 #[derive(Debug, Copy, Clone)]
-enum MinerMessage {
+enum ToMiner {
+    Quit,
     Start(Block),
     Pause,
+}
+
+#[derive(Debug, Copy, Clone)]
+enum ToPeer {
     Quit,
-}
-
-#[derive(Debug, Copy, Clone)]
-struct NewBlock {
-    block: Block,
-    from: Option<SocketAddr>,
-}
-
-#[derive(Debug, Copy, Clone)]
-enum ConnectionMessage {
-    Quit,
-    SendPing,
-    NewBlock(NewBlock),
-}
-
-#[derive(Debug, Copy, Clone)]
-enum NetworkedMessageType {
-    Ping,
-    Pong,
-    Block,
+    Send(NetworkedMessage),
 }
 
 #[derive(Debug, Clone)]
-struct Peer {
-    addr: SocketAddr,
-    block_height: Arc<RwLock<u64>>,
+enum ToNode {
+    Quit,
+    Received(NetworkedMessage, Sender<ToPeer>),
+    Mined(Block),
+    ConnectionEstablished(Sender<ToPeer>),
 }
 
-impl TryFrom<u8> for NetworkedMessageType {
-    type Error = ();
+#[derive(Debug)]
+enum DeserializeError {
+    Io(io::Error),
+    TryFromSlice(array::TryFromSliceError),
+}
 
-    fn try_from(value: u8) -> Result<Self, Self::Error> {
-        match value {
-            x if x == NetworkedMessageType::Ping as u8 => Ok(NetworkedMessageType::Ping),
-            x if x == NetworkedMessageType::Pong as u8 => Ok(NetworkedMessageType::Pong),
-            x if x == NetworkedMessageType::Block as u8 => Ok(NetworkedMessageType::Block),
-            _ => Err(()),
+impl From<io::Error> for DeserializeError {
+    fn from(e: io::Error) -> Self { DeserializeError::Io(e) }
+}
+
+impl From<array::TryFromSliceError> for DeserializeError {
+    fn from(e: array::TryFromSliceError) -> Self { DeserializeError::TryFromSlice(e) }
+}
+
+#[derive(Debug, Copy, Clone)]
+enum NetworkedMessage {
+    Block(Block),
+    Ping,
+    Pong,
+    BlockHeight(u64),
+}
+
+impl NetworkedMessage {
+    fn receive(stream: &TcpStream, r#type: u8) -> Result<NetworkedMessage, DeserializeError> {
+        match r#type {
+            0 => Ok(NetworkedMessage::Ping),
+            1 => Ok(NetworkedMessage::Pong),
+            2 => {
+                eprintln!("Parsing block...");
+                let mut buffer = [0; 32 + 32 + 8 + 1 + 8];
+                stream.set_nonblocking(false)?;
+                // stream.read_exact(&mut buffer)?
+                (&mut (&*stream)).read(&mut buffer)?;
+                stream.set_nonblocking(true)?;
+
+                Ok(NetworkedMessage::Block(Block {
+                    parent_hash: buffer[0..32].try_into()?,
+                    miner_address: buffer[32..64].try_into()?,
+                    nonce: u64::from_le_bytes(buffer[64..72].try_into()?),
+                    difficulty: buffer[72],
+                    time: u64::from_le_bytes(buffer[73..81].try_into()?),
+                }))
+            }
+            3 => {
+                let mut buffer = [0; 8];
+                stream.set_nonblocking(false)?;
+                (&mut (&*stream)).read(&mut buffer)?;
+                stream.set_nonblocking(true)?;
+                Ok(NetworkedMessage::BlockHeight(u64::from_le_bytes(buffer)))
+            }
+            _ => Err(DeserializeError::from(io::Error::new(
+                ErrorKind::InvalidData, format!("Invalid message type: {}", r#type), // TODO: Bad error style
+            )))
         }
     }
 }
@@ -164,40 +154,17 @@ fn difficulty(hash: [u8; 32]) -> u8 {
 //
 // Another interesting task: Persisting the blockchain on shutdown, maybe also some peers?
 
-fn accept_connection(stream: TcpStream, main_sender: Sender<NewBlock>)
-                     -> (JoinHandle<io::Result<()>>, Sender<ConnectionMessage>, Peer) {
+fn accept_connection(stream: TcpStream, node_sender: Sender<ToNode>) -> (JoinHandle<io::Result<()>>, Sender<ToPeer>) {
     stream.set_nonblocking(true).unwrap();
     let peer_addr = stream.peer_addr().unwrap();
     let local_addr = stream.local_addr().unwrap();
     println!("connection: them {}, us {}", peer_addr, local_addr);
-    let peer = Peer {
-        addr: peer_addr,
-        block_height: Arc::new(RwLock::new(0)),
-    };
     let (connection_sender, connection_receiver) = channel();
+    let connection_sender_for_thread = connection_sender.clone(); // TODO: Id's/peer_addr instead?
     let connection_thread = spawn(move || -> io::Result<()> {
         let mut writer = BufWriter::new(&stream);
 
-        writer.write(&block_height.to_le_bytes()).unwrap();
-        writer.flush().unwrap();
-
-        let mut block_height_buffer = [0; 8];
-        loop {
-            match Read::read_exact(&mut (&stream), &mut block_height_buffer) {
-                Ok(()) => break,
-                Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                    // TODO: Replace with something smarter and OS dependant
-                    sleep(Duration::from_millis(10));
-                }
-                Err(error) => panic!("error reading {:?}", error),
-            }
-        }
-        let peer_block_height = u64::from_le_bytes(block_height_buffer);
-        {
-            let mut write = peer.block_height.write().unwrap();
-            *write = peer_block_height;
-        }
-        eprintln!("Peer {} has block height {}", peer_addr, peer_block_height);
+        node_sender.send(ToNode::ConnectionEstablished(connection_sender_for_thread.clone())).unwrap();
 
         'main: loop {
             let mut buffer = vec![0; 1];
@@ -208,25 +175,9 @@ fn accept_connection(stream: TcpStream, main_sender: Sender<NewBlock>)
                         break 'stream_events;
                     }
                     Ok(1) => {
-                        match buffer[0].try_into() {
-                            Ok(NetworkedMessageType::Ping) => {
-                                eprintln!("Ping!");
-                                writer.write(&[NetworkedMessageType::Pong as u8]).unwrap();
-                                writer.flush().unwrap();
-                            }
-                            Ok(NetworkedMessageType::Pong) => {
-                                eprintln!("Pong!");
-                            }
-                            Ok(NetworkedMessageType::Block) => {
-                                eprintln!("Parsing block...");
-                                let block = Block::deserialize(&mut (&stream)).unwrap();
-                                main_sender.send(NewBlock { block, from: Some(peer_addr) }).unwrap();
-                            }
-                            Err(()) => {
-                                eprintln!("Received invalid message type {}", buffer[0]);
-                                break 'main;
-                            }
-                        }
+                        let message = NetworkedMessage::receive(&stream, buffer[0]).unwrap();
+                        node_sender.send(ToNode::Received(message, connection_sender_for_thread
+                            .clone())).unwrap();  // TODO: Id's/peer_addr instead?
                     }
                     Ok(count) => panic!("Impossible amount of bytes read {}", count),
                     Err(error) if error.kind() == ErrorKind::WouldBlock => {
@@ -238,28 +189,48 @@ fn accept_connection(stream: TcpStream, main_sender: Sender<NewBlock>)
 
             'channel_events: loop {
                 match connection_receiver.try_recv() {
-                    Ok(ConnectionMessage::Quit) => {
+                    Ok(ToPeer::Quit) => {
                         eprintln!("Quitting connection thread {}->{}", local_addr, peer_addr);
                         break 'main;
                     }
-                    Ok(ConnectionMessage::SendPing) => {
-                        writer.write(&[NetworkedMessageType::Ping as u8]).unwrap();
+                    Ok(ToPeer::Send(NetworkedMessage::Ping)) => {
+                        writer.write(&[0]).unwrap();
                         if let Err(err) = writer.flush() {
                             eprintln!("Connection closed {}->{}: {}",
                                       local_addr, peer_addr, err);
                             break 'main;
                         }
                     }
-                    Ok(ConnectionMessage::NewBlock(NewBlock { block, from })) => {
-                        let should_skip = from.map(|f| f == peer_addr).unwrap_or(false);
-                        if !should_skip {
-                            writer.write(&[NetworkedMessageType::Block as u8]).unwrap();
-                            block.serialize(&mut writer);
-                            if let Err(err) = writer.flush() {
-                                eprintln!("Connection closed {}->{}: {}",
-                                          local_addr, peer_addr, err);
-                                break 'main;
-                            }
+                    Ok(ToPeer::Send(NetworkedMessage::Pong)) => {
+                        writer.write(&[1]).unwrap();
+                        if let Err(err) = writer.flush() {
+                            eprintln!("Connection closed {}->{}: {}",
+                                      local_addr, peer_addr, err);
+                            break 'main;
+                        }
+                    }
+                    Ok(ToPeer::Send(NetworkedMessage::Block(block))) => {
+                        writer.write(&[2]).unwrap();
+                        let mut buffer = vec![0; 0];
+                        for byte in block.parent_hash { buffer.push(byte); }
+                        for byte in block.miner_address { buffer.push(byte); }
+                        for byte in block.nonce.to_le_bytes() { buffer.push(byte); }
+                        for byte in block.difficulty.to_le_bytes() { buffer.push(byte); }
+                        for byte in block.time.to_le_bytes() { buffer.push(byte); }
+                        writer.write_all(&buffer).unwrap();
+                        if let Err(err) = writer.flush() {
+                            eprintln!("Connection closed {}->{}: {}",
+                                      local_addr, peer_addr, err);
+                            break 'main;
+                        }
+                    }
+                    Ok(ToPeer::Send(NetworkedMessage::BlockHeight(block_height))) => {
+                        writer.write(&[3]).unwrap();
+                        writer.write(&block_height.to_le_bytes()).unwrap();
+                        if let Err(err) = writer.flush() {
+                            eprintln!("Connection closed {}->{}: {}",
+                                      local_addr, peer_addr, err);
+                            break 'main;
                         }
                     }
                     Err(e) if e == TryRecvError::Empty => {
@@ -276,12 +247,21 @@ fn accept_connection(stream: TcpStream, main_sender: Sender<NewBlock>)
         Ok(())
     });
 
-    (connection_thread, connection_sender, peer)
+    (connection_thread, connection_sender)
 }
 
 fn main() -> std::io::Result<()> {
+    let args: Vec<String> = args().collect();
+    let mut should_mine = args.contains(&"--mine".to_string()) || args.contains(&"-m".to_string());
+    let listen_addr_str = args.get(1).expect("You must supply a listen addr as arg1");
+    let listener = TcpListener::bind(listen_addr_str).unwrap();
+    listener.set_nonblocking(true).unwrap();
+
+    let (node_sender, node_receiver) = channel();
+
     let quit_requested = Arc::new(AtomicBool::new(false));
     {
+        let node_sender = node_sender.clone();
         let quit_requested = quit_requested.clone();
         ctrlc::set_handler(move || {
             if quit_requested.load(Ordering::SeqCst) {
@@ -290,27 +270,20 @@ fn main() -> std::io::Result<()> {
             } else {
                 eprintln!("\rShutdown requested");
                 quit_requested.store(true, Ordering::SeqCst);
+                node_sender.send(ToNode::Quit).unwrap();
             }
         }).unwrap();
     }
 
-    let args: Vec<String> = args().collect();
-    let mut should_mine = args.contains(&"--mine".to_string()) || args.contains(&"-m".to_string());
-    let listen_addr_str = args.get(1).expect("You must supply a listen addr as arg1");
-    let listener = TcpListener::bind(listen_addr_str).unwrap();
-    listener.set_nonblocking(true).unwrap();
-
-    let (main_sender, main_receiver) = channel();
-
-    let (miner_jobs_sender, miner_jobs_receiver) = channel();
-    let miner_main_sender = main_sender.clone();
+    let (miner_sender, miner_receiver) = channel();
+    let node_sender_for_miner = node_sender.clone();
     let miner_thread = spawn(move || -> io::Result<()> {
         let mut start_time = SystemTime::now();
         let mut job_block = None;
 
         loop {
-            match miner_jobs_receiver.try_recv() {
-                Ok(MinerMessage::Start(parent_block)) => {
+            match miner_receiver.try_recv() {
+                Ok(ToMiner::Start(parent_block)) => {
                     start_time = SystemTime::now();
                     job_block = Some(Block {
                         miner_address: [0; 32],
@@ -320,8 +293,8 @@ fn main() -> std::io::Result<()> {
                         difficulty: parent_block.difficulty,
                     });
                 }
-                Ok(MinerMessage::Pause) => job_block = None,
-                Ok(MinerMessage::Quit) => break,
+                Ok(ToMiner::Pause) => job_block = None,
+                Ok(ToMiner::Quit) => break,
                 Err(TryRecvError::Empty) => {
                     if let Some(mut block) = job_block {
                         if let Some(nonce) = block.nonce.checked_add(1) {
@@ -351,7 +324,7 @@ fn main() -> std::io::Result<()> {
                                 eprintln!("Mining took {} second(s)", seconds);
                             }
 
-                            miner_main_sender.send(NewBlock { block, from: None }).unwrap();
+                            node_sender_for_miner.send(ToNode::Mined(block)).unwrap();
                             job_block = None;
                         }
                     } else {
@@ -383,10 +356,10 @@ fn main() -> std::io::Result<()> {
     // Make outbound connections
     &args.get(2).map(|connect_addr_str| {
         eprintln!("Connecting to {}", connect_addr_str);
-        let main_sender = main_sender.clone();
+        let node_sender = node_sender.clone();
         match TcpStream::connect(connect_addr_str) {
             Ok(stream) => connection_threads.push(
-                accept_connection(stream, main_sender)
+                accept_connection(stream, node_sender)
             ),
             Err(error) => eprintln!("Failed to connect to {}: {}", connect_addr_str, error)
         };
@@ -395,33 +368,15 @@ fn main() -> std::io::Result<()> {
     eprintln!("Seed block {}", blocks.last().unwrap());
 
     if should_mine {
-        miner_jobs_sender.send(MinerMessage::Start(blocks.last().unwrap().clone())).unwrap();
+        miner_sender.send(ToMiner::Start(blocks.last().unwrap().clone())).unwrap();
     }
 
     let mut terminal_input = true;
     let mut command = String::new();
-    loop {
-        if quit_requested.load(Ordering::SeqCst) {
-            miner_jobs_sender.send(MinerMessage::Quit).unwrap();
-            miner_thread.join().unwrap().unwrap();
-
-            connection_threads.retain(|(_, connection_sender)| {
-                if let Err(_) = connection_sender.send(ConnectionMessage::Quit) {
-                    false
-                } else {
-                    true
-                }
-            });
-
-            while let Some((connection_thread, _)) = connection_threads.pop() {
-                connection_thread.join().unwrap().unwrap();
-            }
-            break;
-        }
-
+    'outer: loop {
         match listener.accept() {
             Ok((stream, _)) => {
-                let main_sender = main_sender.clone();
+                let main_sender = node_sender.clone();
                 connection_threads.push(
                     accept_connection(stream, main_sender)
                 );
@@ -443,7 +398,7 @@ fn main() -> std::io::Result<()> {
                             crossterm::event::KeyCode::Enter => {
                                 if command == "ping" || command == "p" {
                                     connection_threads.retain(|(_, connection_sender)| {
-                                        if let Err(_) = connection_sender.send(ConnectionMessage::SendPing) {
+                                        if let Err(_) = connection_sender.send(ToPeer::Send(NetworkedMessage::Ping)) {
                                             false
                                         } else {
                                             true
@@ -452,10 +407,10 @@ fn main() -> std::io::Result<()> {
                                 } else if command == "quit" || command == "q" {
                                     quit_requested.store(true, Ordering::SeqCst);
                                 } else if command == "mine" || command == "m" {
-                                    miner_jobs_sender.send(MinerMessage::Start(blocks.last().unwrap().clone())).unwrap();
+                                    miner_sender.send(ToMiner::Start(blocks.last().unwrap().clone())).unwrap();
                                     should_mine = true;
                                 } else if command == "pause" || command == "p" {
-                                    miner_jobs_sender.send(MinerMessage::Pause).unwrap();
+                                    miner_sender.send(ToMiner::Pause).unwrap();
                                     should_mine = false;
                                 }
                                 command.clear();
@@ -479,15 +434,22 @@ fn main() -> std::io::Result<()> {
         }
 
         loop {
-            match main_receiver.try_recv() {
-                Ok(NewBlock { block, from }) => {
+            match node_receiver.try_recv() {
+                Ok(ToNode::Received(NetworkedMessage::Ping, peer_sender)) => {
+                    eprintln!("Ping!");
+                    peer_sender.send(ToPeer::Send(NetworkedMessage::Pong)).unwrap();
+                }
+                Ok(ToNode::Received(NetworkedMessage::Pong, _)) => {
+                    eprintln!("Pong!");
+                }
+                Ok(ToNode::Received(NetworkedMessage::Block(block), _)) => {
                     let parent = blocks.last().unwrap();
                     if block.parent_hash == parent.hash() &&
                         block.difficulty == parent.difficulty {
                         blocks.push(block);
                         eprintln!("Inserting new block {}\nBlock height: {}", block, blocks.len());
                         connection_threads.retain(|(_, connection_sender)| {
-                            if let Err(_) = connection_sender.send(ConnectionMessage::NewBlock(NewBlock { block, from })) {
+                            if let Err(_) = connection_sender.send(ToPeer::Send(NetworkedMessage::Block(block))) {
                                 false
                             } else {
                                 true
@@ -495,11 +457,57 @@ fn main() -> std::io::Result<()> {
                         });
 
                         if should_mine {
-                            miner_jobs_sender.send(MinerMessage::Start(blocks.last().unwrap().clone())).unwrap();
+                            miner_sender.send(ToMiner::Start(blocks.last().unwrap().clone())).unwrap();
                         }
                     } else {
                         eprintln!("Discarding invalid block {}", block);
                     }
+                }
+                Ok(ToNode::Mined(block)) => {
+                    let parent = blocks.last().unwrap();
+                    if block.parent_hash == parent.hash() &&
+                        block.difficulty == parent.difficulty {
+                        blocks.push(block);
+                        eprintln!("Inserting new block {}\nBlock height: {}", block, blocks.len());
+                        connection_threads.retain(|(_, connection_sender)| {
+                            if let Err(_) = connection_sender.send(ToPeer::Send(NetworkedMessage::Block(block))) {
+                                false
+                            } else {
+                                true
+                            }
+                        });
+
+                        if should_mine {
+                            miner_sender.send(ToMiner::Start(blocks.last().unwrap().clone())).unwrap();
+                        }
+                    } else {
+                        eprintln!("Discarding invalid block {}", block);
+                    }
+                }
+                Ok(ToNode::Received(NetworkedMessage::BlockHeight(block_height), _)) => {
+                    eprintln!("peer has block height: {}", block_height);
+                }
+                Ok(ToNode::ConnectionEstablished(peer_sender)) => {
+                    peer_sender.send(ToPeer::Send(NetworkedMessage::BlockHeight(
+                        blocks.len() as u64
+                    ))).unwrap();
+                }
+                Ok(ToNode::Quit) => {
+                    miner_sender.send(ToMiner::Quit).unwrap();
+                    miner_thread.join().unwrap().unwrap();
+
+                    connection_threads.retain(|(_, connection_sender)| {
+                        if let Err(_) = connection_sender.send(ToPeer::Quit) {
+                            false
+                        } else {
+                            true
+                        }
+                    });
+
+                    while let Some((connection_thread, _)) = connection_threads.pop() {
+                        connection_thread.join().unwrap().unwrap();
+                    }
+                    break 'outer;
                 }
                 Err(_) => break,
             }
