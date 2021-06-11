@@ -4,6 +4,7 @@ use std::env::args;
 use std::io::{BufWriter, ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::process::exit;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Sender, TryRecvError};
@@ -35,6 +36,7 @@ enum ToNode {
     Received(NetworkedMessage, SocketAddr),
     Mined(Block),
     ConnectionEstablished(SocketAddr),
+    Connect(SocketAddr),
 }
 
 #[derive(Debug)]
@@ -56,7 +58,8 @@ enum NetworkedMessage {
     Block(Block),
     Ping,
     Pong,
-    TopBlockHash([u8; 32]),
+    Request([u8; 32]),
+    RequestChild([u8; 32]),
 }
 
 impl NetworkedMessage {
@@ -84,7 +87,14 @@ impl NetworkedMessage {
                 stream.set_nonblocking(false)?;
                 (&mut (&*stream)).read(&mut buffer)?;
                 stream.set_nonblocking(true)?;
-                Ok(NetworkedMessage::TopBlockHash(buffer))
+                Ok(NetworkedMessage::Request(buffer))
+            }
+            4 => {
+                let mut buffer = [0; 32];
+                stream.set_nonblocking(false)?;
+                (&mut (&*stream)).read(&mut buffer)?;
+                stream.set_nonblocking(true)?;
+                Ok(NetworkedMessage::RequestChild(buffer))
             }
             _ => Err(DeserializeError::from(io::Error::new(
                 ErrorKind::InvalidData, format!("Invalid message type: {}", r#type), // TODO: Bad error style
@@ -119,6 +129,7 @@ fn difficulty(hash: [u8; 32]) -> u8 {
 // TODO: Exchange peers
 // TODO: DAG block chain, to resolve consensus problems
 // TODO: File-backed blockchain?
+// TODO: Proper command prompt by making cross-platform cbreak-mode crate
 
 fn accept_connection(stream: TcpStream, node_sender: Sender<ToNode>)
                      -> (SocketAddr, JoinHandle<io::Result<()>>, Sender<ToPeer>) {
@@ -189,8 +200,17 @@ fn accept_connection(stream: TcpStream, node_sender: Sender<ToNode>)
                             break 'main;
                         }
                     }
-                    Ok(ToPeer::Send(NetworkedMessage::TopBlockHash(block_hash))) => {
+                    Ok(ToPeer::Send(NetworkedMessage::Request(block_hash))) => {
                         writer.write(&[3]).unwrap();
+                        writer.write(&block_hash).unwrap();
+                        if let Err(err) = writer.flush() {
+                            eprintln!("Connection closed {}->{}: {}",
+                                      local_addr, peer_addr, err);
+                            break 'main;
+                        }
+                    }
+                    Ok(ToPeer::Send(NetworkedMessage::RequestChild(block_hash))) => {
+                        writer.write(&[4]).unwrap();
                         writer.write(&block_hash).unwrap();
                         if let Err(err) = writer.flush() {
                             eprintln!("Connection closed {}->{}: {}",
@@ -317,14 +337,10 @@ fn main() -> std::io::Result<()> {
     // Make outbound connections
 
     args.get(2).map(|arg| {
-        eprintln!("Connecting to {}", arg);
-        let node_sender = node_sender.clone();
-        match TcpStream::connect(arg) {
-            Ok(stream) => connections.push(
-                accept_connection(stream, node_sender)
-            ),
-            Err(error) => eprintln!("Failed to connect to {}: {}", arg, error)
-        };
+        match SocketAddr::from_str(arg) {
+            Ok(addr) => node_sender.send(ToNode::Connect(addr)).unwrap(),
+            Err(e) => eprintln!("Invalid address {}: {}", arg, e)
+        }
     });
 
     if should_mine {
@@ -354,7 +370,7 @@ fn main() -> std::io::Result<()> {
                     = crossterm::event::read().unwrap() {
                         match code {
                             crossterm::event::KeyCode::Enter => {
-                                if command == "ping" || command == "p" {
+                                if command == "ping" {
                                     connections.retain(|(_, _, connection_sender)| {
                                         if let Err(_) = connection_sender.send(ToPeer::Send(NetworkedMessage::Ping)) {
                                             false
@@ -370,6 +386,14 @@ fn main() -> std::io::Result<()> {
                                 } else if command == "pause" || command == "p" {
                                     miner_sender.send(ToMiner::Pause).unwrap();
                                     should_mine = false;
+                                } else if command == "top" || command == "t" {
+                                    eprintln!("{}, blockheight: {}", blockchain.top(), blockchain.block_height(blockchain.top().hash()).unwrap())
+                                } else {
+                                    let command: Vec<&str> = command.split(' ').collect();
+                                    if *command.first().unwrap() == "connect"
+                                        || *command.first().unwrap() == "c" {
+                                        node_sender.send(ToNode::Connect(SocketAddr::from_str(command[1]).unwrap())).unwrap()
+                                    }
                                 }
                                 command.clear();
                             }
@@ -422,29 +446,61 @@ fn main() -> std::io::Result<()> {
                                 });
 
                                 for (addr, _, connection_sender) in &connections {
+                                    // if in sync
                                     if *addr == from {
                                         connection_sender.send(ToPeer::Send(
-                                            NetworkedMessage::TopBlockHash(blockchain.top().hash())
+                                            NetworkedMessage::RequestChild(block.hash())
                                         )).unwrap();
                                     }
+                                    // it not in sync
+                                    // if *addr != from {
+                                    //     connection_sender.send(ToPeer::Send(
+                                    //         NetworkedMessage::Block(block)
+                                    //     )).unwrap();
+                                    // }
                                 }
 
                                 if should_mine {
                                     miner_sender.send(ToMiner::Start(blockchain.top().clone())).unwrap();
                                 }
                             }
+                            Err(blockchain::AddBlockError::MissingParent) => {
+                                for (addr, _, connection_sender) in &connections {
+                                    if *addr == from {
+                                        connection_sender.send(ToPeer::Send(NetworkedMessage::Request(block.parent_hash))).unwrap()
+                                    }
+                                }
+                            }
                             Err(_) => eprintln!("Discarding invalid block {}", block)
                         }
                     } else {
+                        // for (addr, _, connection_sender) in &connections {
+                        //     if *addr == from {
+                        //         connection_sender.send(ToPeer::Send(
+                        //             NetworkedMessage::RequestChild(block.hash())
+                        //         )).unwrap();
+                        //     }
+                        // }
                         eprintln!("Ignoring duplicate block {}", hex::encode(block.hash()))
                     }
                 }
-                Ok(ToNode::Received(NetworkedMessage::TopBlockHash(block_hash), from)) => {
-                    eprintln!("peer has block top: {}", hex::encode(block_hash));
+                Ok(ToNode::Received(NetworkedMessage::Request(block_hash), from)) => {
+                    eprintln!("peer requests: {}", hex::encode(block_hash));
+                    for (addr, _, connection_sender) in &connections {
+                        if *addr == from {
+                            blockchain.get(block_hash).map(|block| {
+                                connection_sender.send(ToPeer::Send(
+                                    NetworkedMessage::Block(block)
+                                )).unwrap();
+                            });
+                        }
+                    }
+                }
+                Ok(ToNode::Received(NetworkedMessage::RequestChild(block_hash), from)) => {
+                    eprintln!("peer requests child: {}", hex::encode(block_hash));
                     for (addr, _, connection_sender) in &connections {
                         if *addr == from {
                             blockchain.get_child(block_hash).map(|block| {
-                                eprintln!("Sending child block back");
                                 connection_sender.send(ToPeer::Send(
                                     NetworkedMessage::Block(block)
                                 )).unwrap();
@@ -475,8 +531,8 @@ fn main() -> std::io::Result<()> {
                 Ok(ToNode::ConnectionEstablished(connected_addr)) => {
                     for (addr, _, connection_sender) in &connections {
                         if *addr == connected_addr {
-                            connection_sender.send(ToPeer::Send(NetworkedMessage::TopBlockHash(
-                                blockchain.top().hash()
+                            connection_sender.send(ToPeer::Send(NetworkedMessage::Block(
+                                blockchain.top()
                             ))).unwrap();
                         }
                     }
@@ -497,6 +553,16 @@ fn main() -> std::io::Result<()> {
                         connection_thread.join().unwrap().unwrap();
                     }
                     break 'outer;
+                }
+                Ok(ToNode::Connect(addr)) => {
+                    eprintln!("Connecting to {}", addr);
+                    let node_sender = node_sender.clone();
+                    match TcpStream::connect(addr) {
+                        Ok(stream) => connections.push(
+                            accept_connection(stream, node_sender)
+                        ),
+                        Err(error) => eprintln!("Failed to connect to {}: {}", addr, error)
+                    };
                 }
                 Err(_) => break,
             }

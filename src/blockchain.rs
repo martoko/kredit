@@ -2,9 +2,12 @@ use std::fmt;
 
 use sha2::{Digest, Sha256};
 
+use crate::difficulty;
+
 #[derive(Debug, Clone)]
 pub enum AddBlockError {
-    MissingParent
+    MissingParent,
+    InvalidHash,
 }
 
 #[derive(Debug)]
@@ -22,11 +25,11 @@ impl Blockchain {
     pub fn add(&mut self, block: Block) -> Result<(), AddBlockError> {
         match self.get(block.parent_hash) {
             Some(parent) => {
-                if parent.hash() == self.blocks.last().unwrap().hash() {
+                if difficulty(block.hash()) != parent.difficulty {
+                    Err(AddBlockError::InvalidHash)
+                } else {
                     self.blocks.push(block);
                     Ok(())
-                } else {
-                    todo!()
                 }
             }
             None => Err(AddBlockError::MissingParent),
@@ -43,11 +46,14 @@ impl Blockchain {
         None
     }
 
+    // Returns the child of the main chain
     pub fn get_child(&self, parent_hash: [u8; 32]) -> Option<Block> {
-        for &block in &self.blocks {
-            if block.parent_hash == parent_hash {
-                return Some(block);
+        let mut block = Some(self.top());
+        while let Some(value) = block {
+            if value.parent_hash == parent_hash {
+                return Some(value);
             }
+            block = self.get(value.parent_hash);
         }
 
         None
@@ -58,17 +64,33 @@ impl Blockchain {
     }
 
     pub fn top(&self) -> Block {
-        *self.blocks.last().unwrap()
-    }
+        let mut best_block = self.genesis();
+        let mut best_height = self.block_height(best_block.hash()).unwrap();
 
-    pub fn block_height(&self, hash: [u8; 32]) -> Option<u64> {
-        for i in 0..self.blocks.len() {
-            if self.blocks[i].hash() == hash {
-                return Some(i as u64);
+        for block in &self.blocks {
+            let height = self.block_height(block.hash()).unwrap();
+            if height > best_height {
+                best_height = height;
+                best_block = *block;
             }
         }
 
-        None
+        best_block
+    }
+
+    pub fn block_height(&self, hash: [u8; 32]) -> Option<u64> {
+        if let Some(block) = self.get(hash) {
+            let mut height = 0 as u64;
+            let mut block = self.get(block.parent_hash);
+            while let Some(value) = block {
+                height += 1;
+                block = self.get(value.parent_hash);
+            }
+
+            Some(height)
+        } else {
+            None
+        }
     }
 
     pub fn contains(&self, hash: [u8; 32]) -> bool {
