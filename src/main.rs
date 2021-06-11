@@ -1,7 +1,6 @@
 use std::{array, io};
 use std::convert::TryInto;
 use std::env::args;
-use std::fmt;
 use std::io::{BufWriter, ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::process::exit;
@@ -11,47 +10,11 @@ use std::sync::mpsc::{channel, Sender, TryRecvError};
 use std::thread::{JoinHandle, sleep, spawn};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use sha2::{Digest, Sha256};
+use blockchain::Block;
 
-#[derive(Debug, Copy, Clone)]
-struct Block {
-    parent_hash: [u8; 32],
-    miner_address: [u8; 32],
-    nonce: u64,
-    difficulty: u8,
-    time: u64,
-}
+use crate::blockchain::Blockchain;
 
-impl Block {
-    fn hash(&self) -> [u8; 32] {
-        let mut sha256 = Sha256::new();
-        sha256.update(self.parent_hash);
-        sha256.update(self.miner_address);
-        sha256.update(self.nonce.to_le_bytes());
-        sha256.update(self.difficulty.to_le_bytes());
-        sha256.update(self.time.to_le_bytes());
-        sha256.finalize().into()
-    }
-}
-
-impl fmt::Display for Block {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{{\n\
-        hash: {},\n\
-        parent_hash: {},\n\
-        miner_address: {},\n\
-        nonce: {},\n\
-        time: {},\n\
-        difficulty: {}\n\
-        }}",
-               hex::encode(self.hash()),
-               hex::encode(self.parent_hash),
-               hex::encode(self.miner_address),
-               hex::encode(self.nonce.to_le_bytes()),
-               self.time,
-               self.difficulty)
-    }
-}
+mod blockchain;
 
 #[derive(Debug, Copy, Clone)]
 enum ToMiner {
@@ -102,7 +65,6 @@ impl NetworkedMessage {
             0 => Ok(NetworkedMessage::Ping),
             1 => Ok(NetworkedMessage::Pong),
             2 => {
-                eprintln!("Parsing block...");
                 let mut buffer = [0; 32 + 32 + 8 + 1 + 8];
                 stream.set_nonblocking(false)?;
                 // stream.read_exact(&mut buffer)?
@@ -153,6 +115,10 @@ fn difficulty(hash: [u8; 32]) -> u8 {
 // Phase 3, maintain the blockchain & mine
 //
 // Another interesting task: Persisting the blockchain on shutdown, maybe also some peers?
+
+// TODO: Exchange peers
+// TODO: DAG block chain, to resolve consensus problems
+// TODO: File-backed blockchain?
 
 fn accept_connection(stream: TcpStream, node_sender: Sender<ToNode>)
                      -> (SocketAddr, JoinHandle<io::Result<()>>, Sender<ToPeer>) {
@@ -338,23 +304,19 @@ fn main() -> std::io::Result<()> {
         Ok(())
     });
 
-    let seed_block = Block {
+    let mut blockchain = Blockchain::new(Block {
         miner_address: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
         parent_hash: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
         nonce: 0,
         time: 1622999578, // SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
         difficulty: 2, // 2 gives results in 0-5 seconds, 3 gives results in 3-10 minutes
-    };
-
-
-    let mut blocks = Vec::new();
-    blocks.push(seed_block);
+    });
 
     let mut connections = Vec::new();
 
     // Make outbound connections
 
-    for arg in &args[2..] {
+    args.get(2).map(|arg| {
         eprintln!("Connecting to {}", arg);
         let node_sender = node_sender.clone();
         match TcpStream::connect(arg) {
@@ -363,12 +325,10 @@ fn main() -> std::io::Result<()> {
             ),
             Err(error) => eprintln!("Failed to connect to {}: {}", arg, error)
         };
-    }
-
-    eprintln!("Seed block {}", blocks.last().unwrap());
+    });
 
     if should_mine {
-        miner_sender.send(ToMiner::Start(blocks.last().unwrap().clone())).unwrap();
+        miner_sender.send(ToMiner::Start(blockchain.top().clone())).unwrap();
     }
 
     let mut terminal_input = true;
@@ -405,7 +365,7 @@ fn main() -> std::io::Result<()> {
                                 } else if command == "quit" || command == "q" {
                                     quit_requested.store(true, Ordering::SeqCst);
                                 } else if command == "mine" || command == "m" {
-                                    miner_sender.send(ToMiner::Start(blocks.last().unwrap().clone())).unwrap();
+                                    miner_sender.send(ToMiner::Start(blockchain.top().clone())).unwrap();
                                     should_mine = true;
                                 } else if command == "pause" || command == "p" {
                                     miner_sender.send(ToMiner::Pause).unwrap();
@@ -445,78 +405,78 @@ fn main() -> std::io::Result<()> {
                     eprintln!("Pong!");
                 }
                 Ok(ToNode::Received(NetworkedMessage::Block(block), from)) => {
-                    let parent = blocks.last().unwrap();
-                    if block.parent_hash == parent.hash() &&
-                        block.difficulty == parent.difficulty {
-                        blocks.push(block);
-                        eprintln!("Inserting new block {}\nBlock height: {}", block, blocks.len());
-                        connections.retain(|(addr, _, connection_sender)| {
-                            if *addr == from { return true; }
+                    eprintln!("Got block {} from {}", hex::encode(block.hash()), from);
+                    if !blockchain.contains(block.hash()) {
+                        match blockchain.add(block) {
+                            Ok(()) => {
+                                eprintln!("Inserting new block {}\nBlock height: {}", block,
+                                          blockchain.block_height(block.hash()).unwrap());
+                                connections.retain(|(addr, _, connection_sender)| {
+                                    if *addr == from { return true; }
 
-                            if let Err(_) = connection_sender.send(ToPeer::Send(NetworkedMessage::Block(block))) {
-                                false
-                            } else {
-                                true
+                                    if let Err(_) = connection_sender.send(ToPeer::Send(NetworkedMessage::Block(block))) {
+                                        false
+                                    } else {
+                                        true
+                                    }
+                                });
+
+                                for (addr, _, connection_sender) in &connections {
+                                    if *addr == from {
+                                        connection_sender.send(ToPeer::Send(
+                                            NetworkedMessage::TopBlockHash(blockchain.top().hash())
+                                        )).unwrap();
+                                    }
+                                }
+
+                                if should_mine {
+                                    miner_sender.send(ToMiner::Start(blockchain.top().clone())).unwrap();
+                                }
                             }
-                        });
-
-                        for (addr, _, connection_sender) in &connections {
-                            if *addr == from {
-                                connection_sender.send(ToPeer::Send(
-                                    NetworkedMessage::TopBlockHash(blocks.last().unwrap().hash())
-                                )).unwrap();
-                            }
-                        }
-
-                        if should_mine {
-                            miner_sender.send(ToMiner::Start(blocks.last().unwrap().clone())).unwrap();
+                            Err(_) => eprintln!("Discarding invalid block {}", block)
                         }
                     } else {
-                        eprintln!("Discarding invalid block {}, block height {}", block, blocks
-                            .len());
+                        eprintln!("Ignoring duplicate block {}", hex::encode(block.hash()))
                     }
                 }
                 Ok(ToNode::Received(NetworkedMessage::TopBlockHash(block_hash), from)) => {
                     eprintln!("peer has block top: {}", hex::encode(block_hash));
-                    for block in &blocks {
-                        if block.parent_hash == block_hash {
-                            for (addr, _, connection_sender) in &connections {
-                                if *addr == from {
-                                    connection_sender.send(ToPeer::Send(
-                                        NetworkedMessage::Block(*block)
-                                    )).unwrap();
-                                }
-                            }
-                            break;
+                    for (addr, _, connection_sender) in &connections {
+                        if *addr == from {
+                            blockchain.get_child(block_hash).map(|block| {
+                                eprintln!("Sending child block back");
+                                connection_sender.send(ToPeer::Send(
+                                    NetworkedMessage::Block(block)
+                                )).unwrap();
+                            });
                         }
                     }
                 }
                 Ok(ToNode::Mined(block)) => {
-                    let parent = blocks.last().unwrap();
-                    if block.parent_hash == parent.hash() &&
-                        block.difficulty == parent.difficulty {
-                        blocks.push(block);
-                        eprintln!("Inserting new block {}\nBlock height: {}", block, blocks.len());
-                        connections.retain(|(_, _, connection_sender)| {
-                            if let Err(_) = connection_sender.send(ToPeer::Send(NetworkedMessage::Block(block))) {
-                                false
-                            } else {
-                                true
-                            }
-                        });
+                    match blockchain.add(block) {
+                        Ok(()) => {
+                            eprintln!("Inserting new block {}\nBlock height: {}", block,
+                                      blockchain.block_height(block.hash()).unwrap());
+                            connections.retain(|(_, _, connection_sender)| {
+                                if let Err(_) = connection_sender.send(ToPeer::Send(NetworkedMessage::Block(block))) {
+                                    false
+                                } else {
+                                    true
+                                }
+                            });
 
-                        if should_mine {
-                            miner_sender.send(ToMiner::Start(blocks.last().unwrap().clone())).unwrap();
+                            if should_mine {
+                                miner_sender.send(ToMiner::Start(blockchain.top().clone())).unwrap();
+                            }
                         }
-                    } else {
-                        eprintln!("Discarding invalid block {}", block);
+                        Err(_) => eprintln!("Discarding invalid block {}", block)
                     }
                 }
                 Ok(ToNode::ConnectionEstablished(connected_addr)) => {
                     for (addr, _, connection_sender) in &connections {
                         if *addr == connected_addr {
                             connection_sender.send(ToPeer::Send(NetworkedMessage::TopBlockHash(
-                                blocks.last().unwrap().hash()
+                                blockchain.top().hash()
                             ))).unwrap();
                         }
                     }
