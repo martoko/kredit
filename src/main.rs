@@ -1,15 +1,15 @@
 use std::{array, io};
 use std::convert::TryInto;
-use std::env::args;
 use std::io::{BufWriter, ErrorKind, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, TcpListener, TcpStream};
 use std::process::exit;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Sender, TryRecvError};
 use std::thread::{JoinHandle, sleep, spawn};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use structopt::StructOpt;
 
 use blockchain::Block;
 
@@ -41,7 +41,7 @@ pub enum ToNode {
     SendPing,
     StartMining,
     PauseMining,
-    ShowTopBlock
+    ShowTopBlock,
 }
 
 #[derive(Debug)]
@@ -322,11 +322,26 @@ fn accept_connection(stream: TcpStream, node_sender: Sender<ToNode>)
     (peer_addr, connection_thread, connection_sender)
 }
 
+#[derive(StructOpt, Debug)]
+#[structopt()]
+struct Args {
+    /// Bind node to this address
+    #[structopt()]
+    address: SocketAddr,
+
+    /// Connect to this address
+    #[structopt(short, long)]
+    connect: Vec<SocketAddr>,
+
+    /// Start mining right away
+    #[structopt(short, long)]
+    mine: bool,
+}
+
 fn main() -> std::io::Result<()> {
-    let args: Vec<String> = args().collect();
-    let mut should_mine = args.contains(&"--mine".to_string()) || args.contains(&"-m".to_string());
-    let listen_addr_str = args.get(1).expect("You must supply a listen addr as arg1");
-    let listener = TcpListener::bind(listen_addr_str).unwrap();
+    let args = Args::from_args();
+    let mut should_mine = args.mine;
+    let listener = TcpListener::bind(args.address).unwrap();
     listener.set_nonblocking(true).unwrap();
 
     let (node_sender, node_receiver) = channel();
@@ -421,18 +436,13 @@ fn main() -> std::io::Result<()> {
     let mut connections = Vec::new();
 
     // Make outbound connections
-
-    args.get(2).map(|arg| {
-        match SocketAddr::from_str(arg) {
-            Ok(addr) => node_sender.send(ToNode::Connect(addr)).unwrap(),
-            Err(e) => eprintln!("Invalid address {}: {}", arg, e)
-        }
-    });
+    for addr in args.connect {
+        node_sender.send(ToNode::Connect(addr)).unwrap()
+    }
 
     if should_mine {
         miner_sender.send(ToMiner::Start(blockchain.top().clone())).unwrap();
     }
-
     let mut terminal_input_enabled = true;
     let mut command_reader = terminal_input::CommandReader::new();
     'outer: loop {
