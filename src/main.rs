@@ -16,6 +16,7 @@ use blockchain::Block;
 use crate::blockchain::Blockchain;
 
 mod blockchain;
+mod terminal_input;
 
 #[derive(Debug, Copy, Clone)]
 enum ToMiner {
@@ -31,12 +32,16 @@ enum ToPeer {
 }
 
 #[derive(Debug, Clone)]
-enum ToNode {
+pub enum ToNode {
     Quit,
     Received(NetworkedMessage, SocketAddr),
     Mined(Block),
     ConnectionEstablished(SocketAddr),
     Connect(SocketAddr),
+    SendPing,
+    StartMining,
+    PauseMining,
+    ShowTopBlock
 }
 
 #[derive(Debug)]
@@ -54,7 +59,7 @@ impl From<array::TryFromSliceError> for DeserializeError {
 }
 
 #[derive(Debug, Clone)]
-enum NetworkedMessage {
+pub enum NetworkedMessage {
     Block(Block),
     Ping,
     Pong,
@@ -335,7 +340,6 @@ fn main() -> std::io::Result<()> {
                 eprintln!("\rExiting forcefully");
                 exit(1);
             } else {
-                eprintln!("\rShutdown requested");
                 quit_requested.store(true, Ordering::SeqCst);
                 node_sender.send(ToNode::Quit).unwrap();
             }
@@ -429,70 +433,30 @@ fn main() -> std::io::Result<()> {
         miner_sender.send(ToMiner::Start(blockchain.top().clone())).unwrap();
     }
 
-    let mut terminal_input = true;
-    let mut command = String::new();
+    let mut terminal_input_enabled = true;
+    let mut command_reader = terminal_input::CommandReader::new();
     'outer: loop {
-        match listener.accept() {
-            Ok((stream, _)) => {
-                let main_sender = node_sender.clone();
-                connections.push(accept_connection(stream, main_sender));
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    let main_sender = node_sender.clone();
+                    connections.push(accept_connection(stream, main_sender));
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                Err(error) => eprintln!("Error when accepting listeners: {}", error),
             }
-            Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                // TODO: Replace with something smarter and OS dependant
-                sleep(Duration::from_millis(10));
-            }
-            Err(error) => eprintln!("Error when accepting listeners: {}", error),
         }
 
-        if terminal_input {
-            match crossterm::event::poll(Duration::from_secs(0)) {
-                Ok(true) => {
-                    // It's guaranteed that read() wont block if `poll` returns `Ok(true)`
-                    if let crossterm::event::Event::Key(crossterm::event::KeyEvent { code, .. })
-                    = crossterm::event::read().unwrap() {
-                        match code {
-                            crossterm::event::KeyCode::Enter => {
-                                if command == "ping" {
-                                    connections.retain(|(_, _, connection_sender)| {
-                                        if let Err(_) = connection_sender.send(ToPeer::Send(NetworkedMessage::Ping)) {
-                                            false
-                                        } else {
-                                            true
-                                        }
-                                    });
-                                } else if command == "quit" || command == "q" {
-                                    quit_requested.store(true, Ordering::SeqCst);
-                                } else if command == "mine" || command == "m" {
-                                    miner_sender.send(ToMiner::Start(blockchain.top().clone())).unwrap();
-                                    should_mine = true;
-                                } else if command == "pause" || command == "p" {
-                                    miner_sender.send(ToMiner::Pause).unwrap();
-                                    should_mine = false;
-                                } else if command == "top" || command == "t" {
-                                    eprintln!("{}, blockheight: {}", blockchain.top(), blockchain.block_height(blockchain.top().hash()).unwrap())
-                                } else {
-                                    let command: Vec<&str> = command.split(' ').collect();
-                                    if *command.first().unwrap() == "connect"
-                                        || *command.first().unwrap() == "c" {
-                                        node_sender.send(ToNode::Connect(SocketAddr::from_str(command[1]).unwrap())).unwrap()
-                                    }
-                                }
-                                command.clear();
-                            }
-                            crossterm::event::KeyCode::Char(c) => {
-                                command.push(c);
-                            }
-                            _ => {}
-                        }
+        if terminal_input_enabled {
+            loop {
+                match command_reader.poll() {
+                    Ok(to_node) => node_sender.send(to_node).unwrap(),
+                    Err(terminal_input::PollError::WouldBlock) => break,
+                    Err(error) => {
+                        eprintln!("Failed to read from terminal, disabling terminal input: {:?}", error);
+                        terminal_input_enabled = false;
+                        break;
                     }
-                }
-                Ok(false) => {
-                    // TODO: Replace with something smarter and OS dependant
-                    sleep(Duration::from_millis(10));
-                }
-                Err(error) => {
-                    eprintln!("Failed to read from terminal, commands disabled: {:?}", error);
-                    terminal_input = false;
                 }
             }
         }
@@ -634,6 +598,9 @@ fn main() -> std::io::Result<()> {
                     }
                 }
                 Ok(ToNode::Quit) => {
+                    quit_requested.store(true, Ordering::SeqCst);
+                    // The \r is because we might be called from Ctrl+c
+                    eprintln!("\rShutdown requested");
                     miner_sender.send(ToMiner::Quit).unwrap();
                     miner_thread.join().unwrap().unwrap();
 
@@ -660,11 +627,33 @@ fn main() -> std::io::Result<()> {
                         Err(error) => eprintln!("Failed to connect to {}: {}", addr, error)
                     };
                 }
+                Ok(ToNode::StartMining) => {
+                    miner_sender.send(ToMiner::Start(blockchain.top().clone())).unwrap();
+                    should_mine = true;
+                }
+                Ok(ToNode::PauseMining) => {
+                    miner_sender.send(ToMiner::Pause).unwrap();
+                    should_mine = false;
+                }
+                Ok(ToNode::ShowTopBlock) => {
+                    eprintln!("{}, blockheight: {}", blockchain.top(), blockchain.block_height(blockchain.top().hash()).unwrap())
+                }
+                Ok(ToNode::SendPing) => {
+                    // TODO: Move duplicated sending logic somewhere
+                    connections.retain(|(_, _, connection_sender)| {
+                        if let Err(_) = connection_sender.send(ToPeer::Send(NetworkedMessage::Ping)) {
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                }
                 Err(_) => break,
             }
         }
 
-        // TODO: Replace with something smarter and OS dependant
+        // TODO: Replace with something smarter and OS dependant (i.e. sleep until
+        //       terminal/socket/miner event received)
         sleep(Duration::from_millis(10));
     }
 
