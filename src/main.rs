@@ -32,6 +32,13 @@ enum ToPeer {
     Send(NetworkedMessage),
 }
 
+#[derive(Debug)]
+struct Connection {
+    addr: SocketAddr,
+    thread: JoinHandle<io::Result<()>>,
+    sender: Sender<ToPeer>,
+}
+
 #[derive(Debug, Clone)]
 pub enum ToNode {
     Quit,
@@ -72,11 +79,12 @@ fn difficulty(hash: [u8; 32]) -> u8 {
 // TODO: File-backed blockchain datastrcture?
 // TODO: Smarter blockchain datastructure
 // TODO: Proper command prompt by making cross-platform cbreak-mode crate
-// TODO: Clean up all the unwraps, handling closed connections better
+// TODO: Clean up all the unwraps
 // TODO: "peers" command
+// TODO: Simulate poor network conditions
 
 fn accept_connection(stream: TcpStream, node_sender: Sender<ToNode>)
-                     -> (SocketAddr, JoinHandle<io::Result<()>>, Sender<ToPeer>) {
+                     -> Connection {
     stream.set_nonblocking(true).unwrap();
     let peer_addr = stream.peer_addr().unwrap();
     let local_addr = stream.local_addr().unwrap();
@@ -134,7 +142,11 @@ fn accept_connection(stream: TcpStream, node_sender: Sender<ToNode>)
         Ok(())
     });
 
-    (peer_addr, connection_thread, connection_sender)
+    Connection {
+        addr: peer_addr,
+        thread: connection_thread,
+        sender: connection_sender,
+    }
 }
 
 #[derive(StructOpt, Debug)]
@@ -290,9 +302,9 @@ fn main() -> std::io::Result<()> {
             match node_receiver.try_recv() {
                 Ok(ToNode::Received(NetworkedMessage::Ping, from)) => {
                     eprintln!("Ping!");
-                    for (addr, _thread, connection_sender) in &connections {
+                    for Connection { addr, sender, .. } in &connections {
                         if *addr == from {
-                            connection_sender.send(ToPeer::Send(NetworkedMessage::Pong)).unwrap();
+                            sender.send(ToPeer::Send(NetworkedMessage::Pong)).unwrap();
                         }
                     }
                 }
@@ -306,26 +318,27 @@ fn main() -> std::io::Result<()> {
                             Ok(()) => {
                                 eprintln!("Inserting new block {}\nBlock height: {}", block,
                                           blockchain.block_height(block.hash()).unwrap());
-                                connections.retain(|(addr, _, connection_sender)| {
+                                connections.retain(|Connection { addr, sender, .. }| {
                                     if *addr == from { return true; }
 
-                                    if let Err(_) = connection_sender.send(ToPeer::Send(NetworkedMessage::Block(block))) {
+                                    if let Err(_) = sender.send(ToPeer::Send(NetworkedMessage::Block
+                                        (block))) {
                                         false
                                     } else {
                                         true
                                     }
                                 });
 
-                                for (addr, _, connection_sender) in &connections {
+                                for Connection { addr, sender, .. } in &connections {
                                     // if in sync mode
                                     if *addr == from {
-                                        connection_sender.send(ToPeer::Send(
+                                        sender.send(ToPeer::Send(
                                             NetworkedMessage::RequestChild(block.hash())
                                         )).unwrap();
                                     }
                                     // it not in sync mode
                                     if *addr != from {
-                                        connection_sender.send(ToPeer::Send(
+                                        sender.send(ToPeer::Send(
                                             NetworkedMessage::Block(block)
                                         )).unwrap();
                                     }
@@ -336,9 +349,10 @@ fn main() -> std::io::Result<()> {
                                 }
                             }
                             Err(blockchain::AddBlockError::MissingParent) => {
-                                for (addr, _, connection_sender) in &connections {
+                                for Connection { addr, sender, .. } in &connections {
                                     if *addr == from {
-                                        connection_sender.send(ToPeer::Send(NetworkedMessage::Request(block.parent_hash))).unwrap()
+                                        sender.send(ToPeer::Send(NetworkedMessage::Request(block
+                                            .parent_hash))).unwrap()
                                     }
                                 }
                             }
@@ -350,10 +364,10 @@ fn main() -> std::io::Result<()> {
                 }
                 Ok(ToNode::Received(NetworkedMessage::Request(block_hash), from)) => {
                     eprintln!("peer requests: {}", hex::encode(block_hash));
-                    for (addr, _, connection_sender) in &connections {
+                    for Connection { addr, sender, .. } in &connections {
                         if *addr == from {
                             blockchain.get(block_hash).map(|block| {
-                                connection_sender.send(ToPeer::Send(
+                                sender.send(ToPeer::Send(
                                     NetworkedMessage::Block(block)
                                 )).unwrap();
                             });
@@ -362,10 +376,10 @@ fn main() -> std::io::Result<()> {
                 }
                 Ok(ToNode::Received(NetworkedMessage::RequestChild(block_hash), from)) => {
                     eprintln!("peer requests child: {}", hex::encode(block_hash));
-                    for (addr, _, connection_sender) in &connections {
+                    for Connection { addr, sender, .. } in &connections {
                         if *addr == from {
                             blockchain.get_child(block_hash).map(|block| {
-                                connection_sender.send(ToPeer::Send(
+                                sender.send(ToPeer::Send(
                                     NetworkedMessage::Block(block)
                                 )).unwrap();
                             });
@@ -377,8 +391,8 @@ fn main() -> std::io::Result<()> {
                         Ok(()) => {
                             eprintln!("Inserting new block {}\nBlock height: {}", block,
                                       blockchain.block_height(block.hash()).unwrap());
-                            connections.retain(|(_, _, connection_sender)| {
-                                if let Err(_) = connection_sender.send(ToPeer::Send(NetworkedMessage::Block(block))) {
+                            connections.retain(|Connection { sender, .. }| {
+                                if let Err(_) = sender.send(ToPeer::Send(NetworkedMessage::Block(block))) {
                                     false
                                 } else {
                                     true
@@ -393,13 +407,13 @@ fn main() -> std::io::Result<()> {
                     }
                 }
                 Ok(ToNode::ConnectionEstablished(connected_addr)) => {
-                    for (addr, _, connection_sender) in &connections {
+                    for Connection { addr, sender, .. } in &connections {
                         if *addr == connected_addr {
-                            connection_sender.send(ToPeer::Send(NetworkedMessage::Block(
+                            sender.send(ToPeer::Send(NetworkedMessage::Block(
                                 blockchain.top()
                             ))).unwrap();
-                            let peers = connections.iter().map(|(addr, _, _)| *addr).collect();
-                            connection_sender.send(ToPeer::Send(NetworkedMessage::Peers(peers)))
+                            let peers = connections.iter().map(|Connection { addr, .. }| *addr).collect();
+                            sender.send(ToPeer::Send(NetworkedMessage::Peers(peers)))
                                 .unwrap();
                         }
                     }
@@ -408,7 +422,7 @@ fn main() -> std::io::Result<()> {
                     eprintln!("Got {} peers", peers.len());
                     for peer in peers {
                         let mut found = false;
-                        for (addr, _, _) in &connections {
+                        for Connection { addr, .. } in &connections {
                             if *addr == peer {
                                 found = true;
                             }
@@ -429,16 +443,16 @@ fn main() -> std::io::Result<()> {
                     miner_sender.send(ToMiner::Quit).unwrap();
                     miner_thread.join().unwrap().unwrap();
 
-                    connections.retain(|(_, _, connection_sender)| {
-                        if let Err(_) = connection_sender.send(ToPeer::Quit) {
+                    connections.retain(|Connection { sender, .. }| {
+                        if let Err(_) = sender.send(ToPeer::Quit) {
                             false
                         } else {
                             true
                         }
                     });
 
-                    while let Some((_, connection_thread, _)) = connections.pop() {
-                        connection_thread.join().unwrap().unwrap();
+                    while let Some(Connection { thread, .. }) = connections.pop() {
+                        thread.join().unwrap().unwrap();
                     }
                     break 'outer;
                 }
@@ -469,8 +483,8 @@ fn main() -> std::io::Result<()> {
                     eprintln!("Sending ping");
 
                     // TODO: Move duplicated sending logic somewhere
-                    connections.retain(|(_, _, connection_sender)| {
-                        if let Err(_) = connection_sender.send(ToPeer::Send(NetworkedMessage::Ping)) {
+                    connections.retain(|Connection { sender, .. }| {
+                        if let Err(_) = sender.send(ToPeer::Send(NetworkedMessage::Ping)) {
                             false
                         } else {
                             true
