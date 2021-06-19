@@ -34,7 +34,7 @@ enum ToPeer {
 }
 
 #[derive(Debug)]
-struct Connection {
+pub struct Connection {
     addr: SocketAddr,
     thread: JoinHandle<io::Result<()>>,
     sender: Sender<ToPeer>,
@@ -47,12 +47,12 @@ enum Direction {
     Outbound,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum ToNode {
     Quit,
     Received(NetworkedMessage, SocketAddr),
     Mined(Block),
-    ConnectionEstablished(SocketAddr),
+    ConnectionEstablished(Connection),
     Connect(SocketAddr),
     SendPing,
     StartMiner,
@@ -89,6 +89,8 @@ fn difficulty(hash: [u8; 32]) -> u8 {
 // TODO: Better command prompt by making cross-platform cbreak-mode crate
 // TODO: Clean up all the unwraps
 // TODO: Simulate poor network conditions
+// TODO: Non-blocking read_exact
+// TODO: Do not open connection twice between nodes (one outbound and one inbound)
 
 fn accept_connection(stream: TcpStream, node_sender: Sender<ToNode>, direction: Direction)
                      -> Result<Connection, io::Error> {
@@ -99,8 +101,6 @@ fn accept_connection(stream: TcpStream, node_sender: Sender<ToNode>, direction: 
     let (connection_sender, connection_receiver) = channel();
     let connection_thread = spawn(move || -> io::Result<()> {
         let mut writer = BufWriter::new(&stream);
-
-        node_sender.send(ToNode::ConnectionEstablished(peer_addr)).unwrap();
 
         'main: loop {
             let mut buffer = vec![0; 1];
@@ -183,7 +183,7 @@ struct Args {
     mine: bool,
 }
 
-fn main() -> std::io::Result<()> {
+fn main() -> io::Result<()> {
     let args = Args::from_args();
     let mut should_mine = args.mine;
     let listener = TcpListener::bind(args.address).unwrap();
@@ -294,9 +294,9 @@ fn main() -> std::io::Result<()> {
         loop {
             match listener.accept() {
                 Ok((stream, _)) => {
-                    let main_sender = node_sender.clone();
-                    match accept_connection(stream, main_sender, Inbound) {
-                        Ok(connection) => connections.push(connection),
+                    let node_sender_for_connection = node_sender.clone();
+                    match accept_connection(stream, node_sender_for_connection, Inbound) {
+                        Ok(c) => node_sender.send(ToNode::ConnectionEstablished(c)).unwrap(),
                         Err(error) => eprintln!("Error when accepting listeners: {}", error),
                     }
                 }
@@ -421,21 +421,22 @@ fn main() -> std::io::Result<()> {
                         Err(_) => eprintln!("Discarding invalid block {}", block)
                     }
                 }
-                Ok(ToNode::ConnectionEstablished(connected_addr)) => {
-                    for Connection { addr, sender, .. } in &connections {
-                        if *addr == connected_addr {
-                            // TODO: Do not unwrap these, instead close the connection if send fails
-                            sender.send(ToPeer::Send(NetworkedMessage::Block(
-                                blockchain.top()
-                            ))).unwrap();
-                            let peers = connections.iter()
-                                .filter(|Connection { direction, .. }| *direction == Outbound)
-                                .filter(|Connection { addr, .. }| *addr != connected_addr)
-                                .map(|Connection { addr, .. }| *addr).collect();
-                            sender.send(ToPeer::Send(NetworkedMessage::Peers(peers)))
-                                .unwrap();
-                        }
-                    }
+                Ok(ToNode::ConnectionEstablished(connection)) => {
+                    let peers = connections.iter()
+                        .filter(|Connection { direction, .. }| *direction == Outbound)
+                        .map(|Connection { addr, .. }| *addr).collect();
+                    let connection_addr = connection.addr;
+
+                    connection.sender.send(ToPeer::Send(NetworkedMessage::Block(
+                        blockchain.top()
+                    ))).and_then(|()| {
+                        connection.sender.send(ToPeer::Send(NetworkedMessage::Peers(peers)))
+                    }).and_then(|()| {
+                        connections.push(connection);
+                        Ok(())
+                    }).unwrap_or_else(|error| {
+                        eprintln!("Connection closed {}: {}", connection_addr, error)
+                    });
                 }
                 Ok(ToNode::Received(NetworkedMessage::Peers(peers), _)) => {
                     eprintln!("Got {} peers", peers.len());
@@ -471,10 +472,10 @@ fn main() -> std::io::Result<()> {
                 }
                 Ok(ToNode::Connect(addr)) => {
                     eprintln!("Connecting to {}", addr);
-                    let node_sender = node_sender.clone();
+                    let node_sender_for_connection = node_sender.clone();
                     match TcpStream::connect(addr) {
-                        Ok(stream) => match accept_connection(stream, node_sender, Outbound) {
-                            Ok(connection) => connections.push(connection),
+                        Ok(stream) => match accept_connection(stream, node_sender_for_connection, Outbound) {
+                            Ok(c) => node_sender.send(ToNode::ConnectionEstablished(c)).unwrap(),
                             Err(error) => eprintln!("Failed to connect to {}: {}", addr, error),
                         }
                         Err(error) => eprintln!("Failed to connect to {}: {}", addr, error)
