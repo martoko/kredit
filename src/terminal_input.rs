@@ -45,8 +45,8 @@ impl CommandReader {
                                     match iterator.next() {
                                         Some("ping") => return Ok(SendPing),
                                         Some("quit") | Some("q") => return Ok(Quit),
-                                        Some("mine") | Some("m") => return Ok(StartMining),
-                                        Some("pause") | Some("p") => return Ok(PauseMining),
+                                        Some("mine") | Some("m") => return Ok(StartMiner),
+                                        Some("pause") | Some("p") => return Ok(StopMiner),
                                         Some("top") | Some("t") => return Ok(ShowTopBlock),
                                         Some("connect") | Some("c") => {
                                             match iterator.next() {

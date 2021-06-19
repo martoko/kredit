@@ -1,7 +1,6 @@
-use std::{array, io};
-use std::convert::TryInto;
-use std::io::{BufWriter, ErrorKind, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, TcpListener, TcpStream};
+use std::io;
+use std::io::{BufWriter, ErrorKind, Read};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::process::exit;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,15 +13,17 @@ use structopt::StructOpt;
 use blockchain::Block;
 
 use crate::blockchain::Blockchain;
+use crate::networked_message::NetworkedMessage;
 
 mod blockchain;
 mod terminal_input;
+mod networked_message;
 
 #[derive(Debug, Copy, Clone)]
 enum ToMiner {
     Quit,
     Start(Block),
-    Pause,
+    Stop,
 }
 
 #[derive(Debug, Clone)]
@@ -39,130 +40,9 @@ pub enum ToNode {
     ConnectionEstablished(SocketAddr),
     Connect(SocketAddr),
     SendPing,
-    StartMining,
-    PauseMining,
+    StartMiner,
+    StopMiner,
     ShowTopBlock,
-}
-
-#[derive(Debug)]
-enum DeserializeError {
-    Io(io::Error),
-    TryFromSlice(array::TryFromSliceError),
-}
-
-impl From<io::Error> for DeserializeError {
-    fn from(e: io::Error) -> Self { DeserializeError::Io(e) }
-}
-
-impl From<array::TryFromSliceError> for DeserializeError {
-    fn from(e: array::TryFromSliceError) -> Self { DeserializeError::TryFromSlice(e) }
-}
-
-#[derive(Debug, Clone)]
-pub enum NetworkedMessage {
-    Block(Block),
-    Ping,
-    Pong,
-    Request([u8; 32]),
-    RequestChild([u8; 32]),
-    Peers(Vec<SocketAddr>),
-}
-
-impl NetworkedMessage {
-    fn receive(stream: &TcpStream, r#type: u8) -> Result<NetworkedMessage, DeserializeError> {
-        match r#type {
-            0 => Ok(NetworkedMessage::Ping),
-            1 => Ok(NetworkedMessage::Pong),
-            2 => {
-                let mut buffer = [0; 32 + 32 + 8 + 1 + 8];
-                stream.set_nonblocking(false)?;
-                // stream.read_exact(&mut buffer)?
-                (&mut (&*stream)).read(&mut buffer)?;
-                stream.set_nonblocking(true)?;
-
-                Ok(NetworkedMessage::Block(Block {
-                    parent_hash: buffer[0..32].try_into()?,
-                    miner_address: buffer[32..64].try_into()?,
-                    nonce: u64::from_le_bytes(buffer[64..72].try_into()?),
-                    difficulty: buffer[72],
-                    time: u64::from_le_bytes(buffer[73..81].try_into()?),
-                }))
-            }
-            3 => {
-                let mut buffer = [0; 32];
-                stream.set_nonblocking(false)?;
-                (&mut (&*stream)).read(&mut buffer)?;
-                stream.set_nonblocking(true)?;
-                Ok(NetworkedMessage::Request(buffer))
-            }
-            4 => {
-                let mut buffer = [0; 32];
-                stream.set_nonblocking(false)?;
-                (&mut (&*stream)).read(&mut buffer)?;
-                stream.set_nonblocking(true)?;
-                Ok(NetworkedMessage::RequestChild(buffer))
-            }
-            5 => {
-                // Read the size of the peers list
-                let mut buffer = [0; 8];
-                stream.set_nonblocking(false)?;
-                (&mut (&*stream)).read(&mut buffer)?;
-                stream.set_nonblocking(true)?;
-                let size = u64::from_le_bytes(buffer);
-
-                // Read the list of peers
-                let mut peers = Vec::new();
-                for _ in 0..size {
-                    // Read a SocketAddr
-                    let mut buffer = [0; 1];
-                    stream.set_nonblocking(false)?;
-                    (&mut (&*stream)).read(&mut buffer)?;
-                    stream.set_nonblocking(true)?;
-                    let ip: IpAddr = match buffer[0] {
-                        // ipv4
-                        0 => {
-                            // Read ipv4
-                            let mut buffer = [0; 4];
-                            stream.set_nonblocking(false)?;
-                            (&mut (&*stream)).read(&mut buffer)?;
-                            stream.set_nonblocking(true)?;
-                            IpAddr::V4(Ipv4Addr::from(buffer))
-                        }
-                        // ipv6
-                        1 => {
-                            // Read ipv6
-                            let mut buffer = [0; 16];
-                            stream.set_nonblocking(false)?;
-                            (&mut (&*stream)).read(&mut buffer)?;
-                            stream.set_nonblocking(true)?;
-                            IpAddr::V6(Ipv6Addr::from(buffer))
-                        }
-                        _ => return Err(DeserializeError::from(io::Error::new(
-                            ErrorKind::InvalidData, format!("Invalid socket addr type: {}", buffer[0]), // TODO: Bad error style
-                        )))
-                    };
-
-                    // Read port
-                    let mut buffer = [0; 2];
-                    stream.set_nonblocking(false)?;
-                    (&mut (&*stream)).read(&mut buffer)?;
-                    stream.set_nonblocking(true)?;
-                    let port = u16::from_le_bytes(buffer);
-
-                    let peer = match ip {
-                        IpAddr::V4(ip) => SocketAddr::from(SocketAddrV4::new(ip, port)),
-                        IpAddr::V6(ip) => SocketAddr::from(SocketAddrV6::new(ip, port, 0, 0))
-                    };
-
-                    peers.push(peer);
-                }
-                Ok(NetworkedMessage::Peers(peers))
-            }
-            _ => Err(DeserializeError::from(io::Error::new(
-                ErrorKind::InvalidData, format!("Invalid message type: {}", r#type), // TODO: Bad error style
-            )))
-        }
-    }
 }
 
 fn difficulty(hash: [u8; 32]) -> u8 {
@@ -219,7 +99,7 @@ fn accept_connection(stream: TcpStream, node_sender: Sender<ToNode>)
                         let message = NetworkedMessage::receive(&stream, buffer[0]).unwrap();
                         node_sender.send(ToNode::Received(message, peer_addr)).unwrap();
                     }
-                    Ok(count) => panic!("Impossible amount of bytes read {}", count),
+                    Ok(count) => panic!("Read more bytes than the size of the buffer {}", count),
                     Err(error) if error.kind() == ErrorKind::WouldBlock => {
                         break 'stream_events;
                     }
@@ -233,75 +113,10 @@ fn accept_connection(stream: TcpStream, node_sender: Sender<ToNode>)
                         eprintln!("Quitting connection thread {}->{}", local_addr, peer_addr);
                         break 'main;
                     }
-                    Ok(ToPeer::Send(NetworkedMessage::Ping)) => {
-                        writer.write(&[0]).unwrap();
-                        if let Err(err) = writer.flush() {
+                    Ok(ToPeer::Send(message)) => {
+                        if let Err(error) = message.send(&mut writer) {
                             eprintln!("Connection closed {}->{}: {}",
-                                      local_addr, peer_addr, err);
-                            break 'main;
-                        }
-                    }
-                    Ok(ToPeer::Send(NetworkedMessage::Pong)) => {
-                        writer.write(&[1]).unwrap();
-                        if let Err(err) = writer.flush() {
-                            eprintln!("Connection closed {}->{}: {}",
-                                      local_addr, peer_addr, err);
-                            break 'main;
-                        }
-                    }
-                    Ok(ToPeer::Send(NetworkedMessage::Block(block))) => {
-                        writer.write(&[2]).unwrap();
-                        let mut buffer = vec![0; 0];
-                        for byte in block.parent_hash { buffer.push(byte); }
-                        for byte in block.miner_address { buffer.push(byte); }
-                        for byte in block.nonce.to_le_bytes() { buffer.push(byte); }
-                        for byte in block.difficulty.to_le_bytes() { buffer.push(byte); }
-                        for byte in block.time.to_le_bytes() { buffer.push(byte); }
-                        writer.write_all(&buffer).unwrap();
-                        if let Err(err) = writer.flush() {
-                            eprintln!("Connection closed {}->{}: {}",
-                                      local_addr, peer_addr, err);
-                            break 'main;
-                        }
-                    }
-                    Ok(ToPeer::Send(NetworkedMessage::Request(block_hash))) => {
-                        writer.write(&[3]).unwrap();
-                        writer.write(&block_hash).unwrap();
-                        if let Err(err) = writer.flush() {
-                            eprintln!("Connection closed {}->{}: {}",
-                                      local_addr, peer_addr, err);
-                            break 'main;
-                        }
-                    }
-                    Ok(ToPeer::Send(NetworkedMessage::RequestChild(block_hash))) => {
-                        writer.write(&[4]).unwrap();
-                        writer.write(&block_hash).unwrap();
-                        if let Err(err) = writer.flush() {
-                            eprintln!("Connection closed {}->{}: {}",
-                                      local_addr, peer_addr, err);
-                            break 'main;
-                        }
-                    }
-                    Ok(ToPeer::Send(NetworkedMessage::Peers(peers))) => {
-                        writer.write(&[5]).unwrap();
-                        writer.write(&(peers.len() as u64).to_le_bytes()).unwrap();
-                        for peer in peers {
-                            match peer {
-                                SocketAddr::V4(addr) => {
-                                    writer.write(&[0]).unwrap();
-                                    writer.write(&addr.ip().octets()).unwrap();
-                                    writer.write(&addr.port().to_le_bytes()).unwrap();
-                                }
-                                SocketAddr::V6(addr) => {
-                                    writer.write(&[1]).unwrap();
-                                    writer.write(&addr.ip().octets()).unwrap();
-                                    writer.write(&addr.port().to_le_bytes()).unwrap();
-                                }
-                            }
-                        }
-                        if let Err(err) = writer.flush() {
-                            eprintln!("Connection closed {}->{}: {}",
-                                      local_addr, peer_addr, err);
+                                      local_addr, peer_addr, error);
                             break 'main;
                         }
                     }
@@ -379,7 +194,7 @@ fn main() -> std::io::Result<()> {
                         difficulty: parent_block.difficulty,
                     });
                 }
-                Ok(ToMiner::Pause) => job_block = None,
+                Ok(ToMiner::Stop) => job_block = None,
                 Ok(ToMiner::Quit) => break,
                 Err(TryRecvError::Empty) => {
                     if let Some(mut block) = job_block {
@@ -637,18 +452,22 @@ fn main() -> std::io::Result<()> {
                         Err(error) => eprintln!("Failed to connect to {}: {}", addr, error)
                     };
                 }
-                Ok(ToNode::StartMining) => {
+                Ok(ToNode::StartMiner) => {
                     miner_sender.send(ToMiner::Start(blockchain.top().clone())).unwrap();
                     should_mine = true;
+                    eprintln!("Mining: {}", should_mine);
                 }
-                Ok(ToNode::PauseMining) => {
-                    miner_sender.send(ToMiner::Pause).unwrap();
+                Ok(ToNode::StopMiner) => {
+                    miner_sender.send(ToMiner::Stop).unwrap();
                     should_mine = false;
+                    eprintln!("Mining: {}", should_mine);
                 }
                 Ok(ToNode::ShowTopBlock) => {
                     eprintln!("{}, blockheight: {}", blockchain.top(), blockchain.block_height(blockchain.top().hash()).unwrap())
                 }
                 Ok(ToNode::SendPing) => {
+                    eprintln!("Sending ping");
+
                     // TODO: Move duplicated sending logic somewhere
                     connections.retain(|(_, _, connection_sender)| {
                         if let Err(_) = connection_sender.send(ToPeer::Send(NetworkedMessage::Ping)) {
