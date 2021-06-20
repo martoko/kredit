@@ -10,8 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use structopt::StructOpt;
 
-use blockchain::Block;
-
+use crate::blockchain::Block;
 use crate::blockchain::Blockchain;
 use crate::Direction::{Inbound, Outbound};
 use crate::networked_message::NetworkedMessage;
@@ -61,7 +60,7 @@ pub enum ToNode {
     Peers,
 }
 
-fn difficulty(hash: [u8; 32]) -> u8 {
+fn difficulty(hash: &[u8; 32]) -> u8 {
     let mut trailing_zeros = 0;
     for i in (0..32).rev() {
         if hash[i] == 0 {
@@ -210,34 +209,39 @@ fn main() -> io::Result<()> {
     let node_sender_for_miner = node_sender.clone();
     let miner_thread = spawn(move || -> io::Result<()> {
         let mut start_time = SystemTime::now();
-        let mut job_block = None;
+        let mut parent_hash: [u8; 32] = [0; 32];
+        let mut miner_address: [u8; 32] = [0; 32];
+        let mut nonce: u64 = 0;
+        let mut difficulty: u8 = 0;
+        let mut time: u64 = 0;
+        let mut is_mining = false;
 
         loop {
             match miner_receiver.try_recv() {
                 Ok(ToMiner::Start(parent_block)) => {
                     start_time = SystemTime::now();
-                    job_block = Some(Block {
-                        miner_address: [0; 32],
-                        parent_hash: parent_block.hash(),
-                        nonce: 0,
-                        time: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
-                        difficulty: parent_block.difficulty,
-                    });
+
+                    parent_hash = *parent_block.hash();
+                    miner_address = [0; 32];
+                    nonce = 0;
+                    difficulty = parent_block.difficulty();
+                    time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+
+                    is_mining = true;
                 }
-                Ok(ToMiner::Stop) => job_block = None,
+                Ok(ToMiner::Stop) => is_mining = false,
                 Ok(ToMiner::Quit) => break,
                 Err(TryRecvError::Empty) => {
-                    if let Some(mut block) = job_block {
-                        if let Some(nonce) = block.nonce.checked_add(1) {
-                            block.nonce = nonce;
+                    if is_mining {
+                        if let Some(new_nonce) = nonce.checked_add(1) {
+                            nonce = new_nonce;
                         } else {
                             // We ran out of nonce, bump the time and restart
-                            block.time = SystemTime::now().duration_since(UNIX_EPOCH)
-                                .unwrap().as_secs();
+                            time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
                         }
-                        job_block = Some(block);
 
-                        if difficulty(block.hash()) >= block.difficulty {
+                        let hash = blockchain::hash(parent_hash, miner_address, nonce, difficulty, time);
+                        if crate::difficulty(&hash) >= difficulty {
                             let duration = start_time.elapsed().unwrap();
                             // Artificially make the minimum mining time 5 seconds
                             // if let Some(duration) = Duration::from_secs(2).checked_sub(duration) {
@@ -255,8 +259,9 @@ fn main() -> io::Result<()> {
                                 eprintln!("Mining took {} second(s)", seconds);
                             }
 
-                            node_sender_for_miner.send(ToNode::Mined(block)).unwrap();
-                            job_block = None;
+                            node_sender_for_miner.send(ToNode::Mined(
+                                Block::new(parent_hash, miner_address, nonce, difficulty, time)
+                            )).unwrap();
                         }
                     } else {
                         // TODO: Replace with something smarter and OS dependant
@@ -270,13 +275,13 @@ fn main() -> io::Result<()> {
         Ok(())
     });
 
-    let mut blockchain = Blockchain::new(Block {
-        miner_address: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-        parent_hash: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-        nonce: 0,
-        time: 1622999578, // SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
-        difficulty: 2, // 2 gives results in 0-5 seconds, 3 gives results in 3-10 minutes
-    });
+    let mut blockchain = Blockchain::new(Block::new(
+        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        0,
+        2, // 2 gives results in 0-5 seconds, 3 gives results in 3-10 minutes
+        1622999578, // SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+    ));
 
     let mut connections = Vec::new();
 
@@ -334,11 +339,11 @@ fn main() -> io::Result<()> {
                 }
                 Ok(ToNode::Received(NetworkedMessage::Block(block), from)) => {
                     eprintln!("Got block {} from {}", hex::encode(block.hash()), from);
-                    if !blockchain.contains(block.hash()) {
+                    if !blockchain.contains(&block.hash()) {
                         match blockchain.add(block) {
                             Ok(()) => {
                                 eprintln!("Inserting new block {}\nBlock height: {}", block,
-                                          blockchain.block_height(block.hash()).unwrap());
+                                          blockchain.height(&block.hash()).unwrap());
                                 connections.retain(|Connection { addr, sender, .. }| {
                                     if *addr == from { return true; }
 
@@ -354,7 +359,7 @@ fn main() -> io::Result<()> {
                                     // if in sync mode
                                     if *addr == from {
                                         sender.send(ToPeer::Send(
-                                            NetworkedMessage::RequestChild(block.hash())
+                                            NetworkedMessage::RequestChild(*block.hash())
                                         )).unwrap();
                                     }
                                     // it not in sync mode
@@ -373,7 +378,7 @@ fn main() -> io::Result<()> {
                                 for Connection { addr, sender, .. } in &connections {
                                     if *addr == from {
                                         sender.send(ToPeer::Send(NetworkedMessage::Request(block
-                                            .parent_hash))).unwrap()
+                                            .parent_hash()))).unwrap()
                                     }
                                 }
                             }
@@ -387,7 +392,7 @@ fn main() -> io::Result<()> {
                     eprintln!("peer requests: {}", hex::encode(block_hash));
                     for Connection { addr, sender, .. } in &connections {
                         if *addr == from {
-                            blockchain.get(block_hash).map(|block| {
+                            blockchain.get(&block_hash).map(|block| {
                                 sender.send(ToPeer::Send(
                                     NetworkedMessage::Block(block)
                                 )).unwrap();
@@ -399,7 +404,7 @@ fn main() -> io::Result<()> {
                     eprintln!("peer requests child: {}", hex::encode(block_hash));
                     for Connection { addr, sender, .. } in &connections {
                         if *addr == from {
-                            blockchain.get_child(block_hash).map(|block| {
+                            blockchain.get_child(&block_hash).map(|block| {
                                 sender.send(ToPeer::Send(
                                     NetworkedMessage::Block(block)
                                 )).unwrap();
@@ -411,7 +416,7 @@ fn main() -> io::Result<()> {
                     match blockchain.add(block) {
                         Ok(()) => {
                             eprintln!("Inserting new block {}\nBlock height: {}", block,
-                                      blockchain.block_height(block.hash()).unwrap());
+                                      blockchain.height(&block.hash()).unwrap());
                             send_to_peers(&mut connections, ToPeer::Send(NetworkedMessage::Block(block)));
 
                             if should_mine {
@@ -492,7 +497,8 @@ fn main() -> io::Result<()> {
                     eprintln!("Mining: {}", should_mine);
                 }
                 Ok(ToNode::ShowTopBlock) => {
-                    eprintln!("{}, blockheight: {}", blockchain.top(), blockchain.block_height(blockchain.top().hash()).unwrap())
+                    eprintln!("{}, blockheight: {}", blockchain.top(), blockchain.height
+                    (&blockchain.top().hash()).unwrap())
                 }
                 Ok(ToNode::SendPing) => {
                     eprintln!("Sending ping");
