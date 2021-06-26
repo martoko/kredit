@@ -1,6 +1,22 @@
-use std::fmt;
+use std::{fmt, io, array};
+use std::convert::TryInto;
+use std::io::{Read, Write};
 
 use sha2::{Digest, Sha256};
+
+#[derive(Debug)]
+pub enum DeserializeBlockError {
+    Io(io::Error),
+    TryFromSlice(array::TryFromSliceError),
+}
+
+impl From<io::Error> for DeserializeBlockError {
+    fn from(e: io::Error) -> Self { DeserializeBlockError::Io(e) }
+}
+
+impl From<array::TryFromSliceError> for DeserializeBlockError {
+    fn from(e: array::TryFromSliceError) -> Self { DeserializeBlockError::TryFromSlice(e) }
+}
 
 #[derive(Debug, Copy, Clone)]
 pub struct Block {
@@ -52,6 +68,31 @@ impl Block {
     pub fn difficulty(&self) -> u8 { self.difficulty }
     pub fn time(&self) -> u64 { self.time }
     pub fn hash(&self) -> &[u8; 32] { &self.hash }
+
+    /// Writes the block using Write::write_all
+    pub fn write(&self, writer: &mut dyn Write) -> Result<(), io::Error> {
+        writer.write_all(&self.parent_hash())?;
+        writer.write_all(&self.miner_address())?;
+        writer.write_all(&self.nonce().to_le_bytes())?;
+        writer.write_all(&self.difficulty().to_le_bytes())?;
+        writer.write_all(&self.time().to_le_bytes())?;
+        Ok(())
+    }
+
+    /// Reads a block using Read::read_exact
+    pub fn read(reader: &mut dyn Read) -> Result<Block, DeserializeBlockError> {
+        let mut buffer = [0; Block::SERIALIZED_LEN];
+        reader.read_exact(&mut buffer)?;
+        Ok(Block::new(
+            buffer[0..32].try_into()?,
+            buffer[32..64].try_into()?,
+            u64::from_le_bytes(buffer[64..72].try_into()?),
+            buffer[72],
+            u64::from_le_bytes(buffer[73..81].try_into()?),
+        ))
+    }
+
+    pub const SERIALIZED_LEN: usize = 32 + 32 + 8 + 1 + 8;
 }
 
 impl fmt::Display for Block {

@@ -49,6 +49,7 @@ impl CommandReader {
                                         Some("pause") | Some("p") => return Ok(StopMiner),
                                         Some("top") | Some("t") => return Ok(ShowTopBlock),
                                         Some("peers") | Some("e") => return Ok(Peers),
+                                        Some("blocks") | Some("b") => return Ok(Blocks),
                                         Some("connect") | Some("c") => {
                                             match iterator.next() {
                                                 Some(address) => {

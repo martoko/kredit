@@ -1,12 +1,14 @@
-use std::io;
-use std::io::{BufWriter, ErrorKind, Read};
-use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::process::exit;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{channel, Sender, TryRecvError};
-use std::thread::{JoinHandle, sleep, spawn};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{
+    io::{BufWriter, ErrorKind, Read},
+    io,
+    net::{SocketAddr, TcpListener, TcpStream},
+    process::exit,
+    sync::Arc,
+    sync::atomic::{AtomicBool, Ordering},
+    sync::mpsc::{channel, Sender, TryRecvError},
+    thread::{JoinHandle, sleep, spawn},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use structopt::StructOpt;
 
@@ -58,6 +60,7 @@ pub enum ToNode {
     StopMiner,
     ShowTopBlock,
     Peers,
+    Blocks,
 }
 
 fn difficulty(hash: &[u8; 32]) -> u8 {
@@ -73,23 +76,21 @@ fn difficulty(hash: &[u8; 32]) -> u8 {
     trailing_zeros
 }
 
-// TODO: Introduce phases
-// Phase 1, seed peers
-//   For now just rely on the user specifying exact IP's
-//   In the future the nodes should exchange peers with each other
-// Phase 2, synchronize blockchain
-//   Maybe just choose a node and ask it to send a full history
-// Phase 3, maintain the blockchain & mine
+// TODO: # Introduce sync phase #
+//       Phase 1, Sync:
+//         seed peers
+//            For now just rely on the user specifying exact IP's
+//            In the future the nodes should exchange peers with each other
+//         synchronize blockchain
+//            Maybe just choose a node and ask it to send a full history
+//       Phase 2, maintain the blockchain & mine
 //
-// Another interesting task: Persisting the blockchain on shutdown, maybe also some peers?
-
 // TODO: File-backed blockchain datastrcture?
-// TODO: Smarter blockchain datastructure
-// TODO: Better command prompt by making cross-platform cbreak-mode crate
+// TODO: Persist peers on shutdown
 // TODO: Clean up all the unwraps
 // TODO: Simulate poor network conditions
-// TODO: Non-blocking read_exact
 // TODO: Do not open connection twice between nodes (one outbound and one inbound)
+//       geth: Peer ID is the public key and is exchanged as part of the handshake
 
 fn accept_connection(stream: TcpStream, node_sender: Sender<ToNode>, direction: Direction)
                      -> Result<Connection, io::Error> {
@@ -180,6 +181,10 @@ struct Args {
     /// Start mining right away
     #[structopt(short, long)]
     mine: bool,
+
+    /// Path to the blockchain database file, if none exists, it will be created
+    #[structopt(short, long)]
+    blockchain_path: String,
 }
 
 fn main() -> io::Result<()> {
@@ -279,9 +284,9 @@ fn main() -> io::Result<()> {
         [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
         [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
         0,
-        2, // 2 gives results in 0-5 seconds, 3 gives results in 3-10 minutes
+        2, // 2 gives results in 0-5 seconds, 3 gives results in 3-10 minutes on my laptop
         1622999578, // SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
-    ));
+    ), &args.blockchain_path).unwrap();
 
     let mut connections = Vec::new();
 
@@ -374,7 +379,7 @@ fn main() -> io::Result<()> {
                                     miner_sender.send(ToMiner::Start(blockchain.top().clone())).unwrap();
                                 }
                             }
-                            Err(blockchain::AddBlockError::MissingParent) => {
+                            Err(blockchain::Error::MissingParent) => {
                                 for Connection { addr, sender, .. } in &connections {
                                     if *addr == from {
                                         sender.send(ToPeer::Send(NetworkedMessage::Request(block
@@ -382,7 +387,7 @@ fn main() -> io::Result<()> {
                                     }
                                 }
                             }
-                            Err(_) => eprintln!("Discarding invalid block {}", block)
+                            Err(e) => eprintln!("Discarding invalid block {:?} {}", e, block)
                         }
                     } else {
                         eprintln!("Ignoring duplicate block {}", hex::encode(block.hash()))
@@ -396,7 +401,7 @@ fn main() -> io::Result<()> {
                                 sender.send(ToPeer::Send(
                                     NetworkedMessage::Block(block)
                                 )).unwrap();
-                            });
+                            }).unwrap();
                         }
                     }
                 }
@@ -404,11 +409,17 @@ fn main() -> io::Result<()> {
                     eprintln!("peer requests child: {}", hex::encode(block_hash));
                     for Connection { addr, sender, .. } in &connections {
                         if *addr == from {
-                            blockchain.get_child(&block_hash).map(|block| {
-                                sender.send(ToPeer::Send(
-                                    NetworkedMessage::Block(block)
-                                )).unwrap();
-                            });
+                            match blockchain.get_child(&block_hash) {
+                                Ok(child) => {
+                                    sender.send(ToPeer::Send(
+                                        NetworkedMessage::Block(child)
+                                    )).unwrap();
+                                }
+                                Err(blockchain::Error::NotFound) => {
+                                    eprintln!("No child found");
+                                }
+                                Err(e) => { panic!("{:?}", e) }
+                            }
                         }
                     }
                 }
@@ -423,7 +434,7 @@ fn main() -> io::Result<()> {
                                 miner_sender.send(ToMiner::Start(blockchain.top().clone())).unwrap();
                             }
                         }
-                        Err(_) => eprintln!("Discarding invalid block {}", block)
+                        Err(e) => eprintln!("Discarding invalid block {:?} {}", e, block)
                     }
                 }
                 Ok(ToNode::ConnectionEstablished(connection)) => {
@@ -509,6 +520,9 @@ fn main() -> io::Result<()> {
                     for connection in connections.iter() {
                         eprintln!("{:#?}", connection);
                     }
+                }
+                Ok(ToNode::Blocks) => {
+                    blockchain.print_blocks().unwrap();
                 }
                 Err(_) => break,
             }

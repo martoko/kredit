@@ -1,9 +1,11 @@
 use std::{array, io};
-use std::convert::TryInto;
 use std::io::{BufWriter, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, TcpStream};
 
-use crate::blockchain::Block;
+use crate::{
+    blockchain::Block,
+    blockchain::DeserializeBlockError,
+};
 
 #[derive(Debug, Clone)]
 pub enum NetworkedMessage {
@@ -19,6 +21,7 @@ pub enum NetworkedMessage {
 pub enum DeserializeError {
     Io(io::Error),
     TryFromSlice(array::TryFromSliceError),
+    DeserializeBlock(DeserializeBlockError),
     InvalidSocketAddrType(u8),
     InvalidMessageType(u8),
 }
@@ -31,24 +34,21 @@ impl From<array::TryFromSliceError> for DeserializeError {
     fn from(e: array::TryFromSliceError) -> Self { DeserializeError::TryFromSlice(e) }
 }
 
+impl From<DeserializeBlockError> for DeserializeError {
+    fn from(e: DeserializeBlockError) -> Self { DeserializeError::DeserializeBlock(e) }
+}
+
 impl NetworkedMessage {
     pub fn receive(stream: &TcpStream, r#type: u8) -> Result<NetworkedMessage, DeserializeError> {
         match r#type {
             0 => Ok(NetworkedMessage::Ping),
             1 => Ok(NetworkedMessage::Pong),
             2 => {
-                let mut buffer = [0; 32 + 32 + 8 + 1 + 8];
                 stream.set_nonblocking(false)?;
-                (&mut (&*stream)).read_exact(&mut buffer)?;
+                let block = Block::read(&mut (&*stream))?;
                 stream.set_nonblocking(true)?;
 
-                Ok(NetworkedMessage::Block(Block::new(
-                    buffer[0..32].try_into()?,
-                    buffer[32..64].try_into()?,
-                    u64::from_le_bytes(buffer[64..72].try_into()?),
-                    buffer[72],
-                    u64::from_le_bytes(buffer[73..81].try_into()?),
-                )))
+                Ok(NetworkedMessage::Block(block))
             }
             3 => {
                 let mut buffer = [0; 32];
@@ -136,11 +136,7 @@ impl NetworkedMessage {
             }
             NetworkedMessage::Block(block) => {
                 writer.write_all(&[2])?;
-                writer.write_all(&block.parent_hash())?;
-                writer.write_all(&block.miner_address())?;
-                writer.write_all(&block.nonce().to_le_bytes())?;
-                writer.write_all(&block.difficulty().to_le_bytes())?;
-                writer.write_all(&block.time().to_le_bytes())?;
+                block.write(writer)?;
                 writer.flush()?;
                 Ok(())
             }
