@@ -5,17 +5,17 @@ use std::io::{Read, Write};
 use sha2::{Digest, Sha256};
 
 #[derive(Debug)]
-pub enum DeserializeBlockError {
+pub enum DeserializeError {
     Io(io::Error),
     TryFromSlice(array::TryFromSliceError),
 }
 
-impl From<io::Error> for DeserializeBlockError {
-    fn from(e: io::Error) -> Self { DeserializeBlockError::Io(e) }
+impl From<io::Error> for DeserializeError {
+    fn from(e: io::Error) -> Self { DeserializeError::Io(e) }
 }
 
-impl From<array::TryFromSliceError> for DeserializeBlockError {
-    fn from(e: array::TryFromSliceError) -> Self { DeserializeBlockError::TryFromSlice(e) }
+impl From<array::TryFromSliceError> for DeserializeError {
+    fn from(e: array::TryFromSliceError) -> Self { DeserializeError::TryFromSlice(e) }
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -80,8 +80,8 @@ impl Block {
     }
 
     /// Reads a block using Read::read_exact
-    pub fn read(reader: &mut dyn Read) -> Result<Block, DeserializeBlockError> {
-        let mut buffer = [0; Block::SERIALIZED_LEN];
+    pub fn read(reader: &mut dyn Read) -> Result<Block, DeserializeError> {
+        let mut buffer = [0; Block::SERIALIZED_LEN as usize];
         reader.read_exact(&mut buffer)?;
         Ok(Block::new(
             buffer[0..32].try_into()?,
@@ -92,7 +92,7 @@ impl Block {
         ))
     }
 
-    pub const SERIALIZED_LEN: usize = 32 + 32 + 8 + 1 + 8;
+    pub const SERIALIZED_LEN: u8 = 32 + 32 + 8 + 1 + 8;
 }
 
 impl fmt::Display for Block {

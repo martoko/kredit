@@ -4,7 +4,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV
 
 use crate::{
     blockchain::Block,
-    blockchain::DeserializeBlockError,
+    blockchain::BlockDeserializeError
 };
 
 #[derive(Debug, Clone)]
@@ -20,8 +20,8 @@ pub enum NetworkedMessage {
 #[derive(Debug)]
 pub enum DeserializeError {
     Io(io::Error),
-    TryFromSlice(array::TryFromSliceError),
-    DeserializeBlock(DeserializeBlockError),
+    ArrayTryFromSlice(array::TryFromSliceError),
+    BlockDeserialize(BlockDeserializeError),
     InvalidSocketAddrType(u8),
     InvalidMessageType(u8),
 }
@@ -31,11 +31,11 @@ impl From<io::Error> for DeserializeError {
 }
 
 impl From<array::TryFromSliceError> for DeserializeError {
-    fn from(e: array::TryFromSliceError) -> Self { DeserializeError::TryFromSlice(e) }
+    fn from(e: array::TryFromSliceError) -> Self { DeserializeError::ArrayTryFromSlice(e) }
 }
 
-impl From<DeserializeBlockError> for DeserializeError {
-    fn from(e: DeserializeBlockError) -> Self { DeserializeError::DeserializeBlock(e) }
+impl From<BlockDeserializeError> for DeserializeError {
+    fn from(e: BlockDeserializeError) -> Self { DeserializeError::BlockDeserialize(e) }
 }
 
 impl NetworkedMessage {

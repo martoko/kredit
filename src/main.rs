@@ -12,10 +12,12 @@ use std::{
 
 use structopt::StructOpt;
 
-use crate::blockchain::Block;
-use crate::blockchain::Blockchain;
-use crate::Direction::{Inbound, Outbound};
-use crate::networked_message::NetworkedMessage;
+use crate::{
+    blockchain::Block,
+    blockchain::Blockchain,
+    Direction::{Inbound, Outbound},
+    networked_message::NetworkedMessage
+};
 
 mod blockchain;
 mod terminal_input;
@@ -85,7 +87,6 @@ fn difficulty(hash: &[u8; 32]) -> u8 {
 //            Maybe just choose a node and ask it to send a full history
 //       Phase 2, maintain the blockchain & mine
 //
-// TODO: File-backed blockchain datastrcture?
 // TODO: Persist peers on shutdown
 // TODO: Clean up all the unwraps
 // TODO: Simulate poor network conditions
@@ -204,6 +205,7 @@ fn main() -> io::Result<()> {
                 eprintln!("\rExiting forcefully");
                 exit(1);
             } else {
+                eprint!("\r"); // Let further printing override the '^C'
                 quit_requested.store(true, Ordering::SeqCst);
                 node_sender.send(ToNode::Quit).unwrap();
             }
@@ -475,12 +477,14 @@ fn main() -> io::Result<()> {
                 Ok(ToNode::Quit) => {
                     quit_requested.store(true, Ordering::SeqCst);
                     // The \r is because we might be called from Ctrl+c
-                    eprintln!("\rShutdown requested");
-                    miner_sender.send(ToMiner::Quit).unwrap();
-                    miner_thread.join().unwrap().unwrap();
+                    eprintln!("Shutdown requested");
 
+                    // Tell threads to quit
+                    miner_sender.send(ToMiner::Quit).unwrap();
                     send_to_peers(&mut connections, ToPeer::Quit);
 
+                    // Wait for threads to quit
+                    miner_thread.join().unwrap().unwrap();
                     while let Some(Connection { thread, .. }) = connections.pop() {
                         thread.join().unwrap().unwrap();
                     }
