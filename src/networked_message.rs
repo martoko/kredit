@@ -2,10 +2,8 @@ use std::{array, io};
 use std::io::{BufWriter, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, TcpStream};
 
-use crate::{
-    blockchain::Block,
-    blockchain::BlockDeserializeError
-};
+use crate::block;
+use crate::block::Block;
 
 #[derive(Debug, Clone)]
 pub enum NetworkedMessage {
@@ -14,14 +12,14 @@ pub enum NetworkedMessage {
     Pong,
     Request([u8; 32]),
     RequestChild([u8; 32]),
-    Peers(Vec<SocketAddr>),
+    PeerAddresses(Vec<SocketAddr>),
 }
 
 #[derive(Debug)]
 pub enum DeserializeError {
     Io(io::Error),
     ArrayTryFromSlice(array::TryFromSliceError),
-    BlockDeserialize(BlockDeserializeError),
+    BlockDeserialize(block::DeserializeError),
     InvalidSocketAddrType(u8),
     InvalidMessageType(u8),
 }
@@ -34,8 +32,8 @@ impl From<array::TryFromSliceError> for DeserializeError {
     fn from(e: array::TryFromSliceError) -> Self { DeserializeError::ArrayTryFromSlice(e) }
 }
 
-impl From<BlockDeserializeError> for DeserializeError {
-    fn from(e: BlockDeserializeError) -> Self { DeserializeError::BlockDeserialize(e) }
+impl From<block::DeserializeError> for DeserializeError {
+    fn from(e: block::DeserializeError) -> Self { DeserializeError::BlockDeserialize(e) }
 }
 
 impl NetworkedMessage {
@@ -47,7 +45,6 @@ impl NetworkedMessage {
                 stream.set_nonblocking(false)?;
                 let block = Block::read(&mut (&*stream))?;
                 stream.set_nonblocking(true)?;
-
                 Ok(NetworkedMessage::Block(block))
             }
             3 => {
@@ -116,7 +113,7 @@ impl NetworkedMessage {
 
                     peers.push(peer);
                 }
-                Ok(NetworkedMessage::Peers(peers))
+                Ok(NetworkedMessage::PeerAddresses(peers))
             }
             r#type => Err(DeserializeError::InvalidMessageType(r#type))
         }
@@ -152,7 +149,7 @@ impl NetworkedMessage {
                 writer.flush()?;
                 Ok(())
             }
-            NetworkedMessage::Peers(peers) => {
+            NetworkedMessage::PeerAddresses(peers) => {
                 writer.write_all(&[5])?;
                 writer.write_all(&(peers.len() as u64).to_le_bytes())?;
                 for peer in peers {

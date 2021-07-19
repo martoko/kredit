@@ -1,4 +1,4 @@
-use std::{fmt, io, array};
+use std::{array, fmt, io};
 use std::convert::TryInto;
 use std::io::{Read, Write};
 
@@ -23,8 +23,9 @@ pub struct Block {
     parent_hash: [u8; 32],
     miner_address: [u8; 32],
     nonce: u64,
-    difficulty: u8,
     time: u64,
+
+    difficulty: u8,
     hash: [u8; 32],
 }
 
@@ -32,34 +33,41 @@ pub fn hash(
     parent_hash: [u8; 32],
     miner_address: [u8; 32],
     nonce: u64,
-    difficulty: u8,
     time: u64,
 ) -> [u8; 32] {
     let mut sha256 = Sha256::new();
     sha256.update(parent_hash);
     sha256.update(miner_address);
     sha256.update(nonce.to_le_bytes());
-    sha256.update(difficulty.to_le_bytes());
     sha256.update(time.to_le_bytes());
     sha256.finalize().into()
 }
 
+pub fn difficulty(hash: &[u8; 32]) -> u8 {
+    let mut trailing_zeros = 0;
+    for i in (0..32).rev() {
+        if hash[i] == 0 {
+            trailing_zeros += 1;
+        } else {
+            break;
+        }
+    }
+
+    trailing_zeros
+}
+
 impl Block {
+    pub const SERIALIZED_LEN: u8 = 32 + 32 + 8 + 8;
+
     pub fn new(
         parent_hash: [u8; 32],
         miner_address: [u8; 32],
         nonce: u64,
-        difficulty: u8,
         time: u64,
     ) -> Block {
-        Block {
-            parent_hash,
-            miner_address,
-            nonce,
-            difficulty,
-            time,
-            hash: hash(parent_hash, miner_address, nonce, difficulty, time),
-        }
+        let hash = hash(parent_hash, miner_address, nonce, time);
+        let difficulty = difficulty(&hash);
+        Block { parent_hash, miner_address, nonce, time, difficulty, hash }
     }
 
     pub fn parent_hash(&self) -> [u8; 32] { self.parent_hash }
@@ -74,7 +82,6 @@ impl Block {
         writer.write_all(&self.parent_hash())?;
         writer.write_all(&self.miner_address())?;
         writer.write_all(&self.nonce().to_le_bytes())?;
-        writer.write_all(&self.difficulty().to_le_bytes())?;
         writer.write_all(&self.time().to_le_bytes())?;
         Ok(())
     }
@@ -87,12 +94,9 @@ impl Block {
             buffer[0..32].try_into()?,
             buffer[32..64].try_into()?,
             u64::from_le_bytes(buffer[64..72].try_into()?),
-            buffer[72],
-            u64::from_le_bytes(buffer[73..81].try_into()?),
+            u64::from_le_bytes(buffer[72..80].try_into()?),
         ))
     }
-
-    pub const SERIALIZED_LEN: u8 = 32 + 32 + 8 + 1 + 8;
 }
 
 impl fmt::Display for Block {
@@ -105,7 +109,7 @@ impl fmt::Display for Block {
         time: {},\n\
         difficulty: {}\n\
         }}",
-               hex::encode(self.hash()),
+               hex::encode(self.hash),
                hex::encode(self.parent_hash),
                hex::encode(self.miner_address),
                hex::encode(self.nonce.to_le_bytes()),

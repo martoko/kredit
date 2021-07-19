@@ -3,13 +3,9 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 
-pub use block::hash;
-
-pub use crate::blockchain::block::Block;
-pub use crate::blockchain::block::DeserializeError as BlockDeserializeError;
-use crate::difficulty;
-
-mod block;
+use crate::block;
+use crate::block::Block;
+use crate::block::difficulty;
 
 #[derive(Debug)]
 pub enum Error {
@@ -51,8 +47,14 @@ impl Blockchain {
                 file.seek(SeekFrom::Start(u64::from(Block::SERIALIZED_LEN)))?;
                 genesis
             }
-            _ => {
-                eprintln!("Discarding invalid blockchain DB");
+            result => {
+                if let Ok(saved_genesis) = result {
+                    eprintln!("Discarding invalid blockchain DB: genesis mismatch\n\n\
+                     Expected:\n{}\nActual:\n{}", genesis, saved_genesis);
+                }
+                if let Err(error) = result {
+                    eprintln!("Discarding invalid blockchain DB: {:?}", error);
+                }
                 file.set_len(0)?;
                 file.seek(SeekFrom::Start(0))?;
                 genesis.write(&mut file)?;
@@ -154,6 +156,7 @@ impl Blockchain {
     }
 
     pub fn print_blocks(&mut self) -> Result<(), Error> {
+        self.file.seek(SeekFrom::Start(0))?;
         loop {
             let address = self.file.stream_position()?;
             match Block::read(&mut self.file) {

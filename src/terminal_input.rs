@@ -1,11 +1,27 @@
-use std::net::SocketAddr;
-use std::str::FromStr;
-use std::time::Duration;
+use std::{
+    net::SocketAddr,
+    str::FromStr,
+    time::Duration,
+};
 
-use crossterm::ErrorKind;
-use crossterm::event::Event;
+use crossterm::{
+    ErrorKind,
+    event::Event,
+};
 
-use crate::ToNode::*;
+use Command::*;
+
+#[derive(Debug)]
+pub enum Command {
+    Quit,
+    Connect(SocketAddr),
+    SendPing,
+    StartMiner,
+    StopMiner,
+    ShowTopBlock,
+    Peers,
+    Blocks,
+}
 
 #[derive(Debug)]
 pub enum PollError {
@@ -28,7 +44,7 @@ impl CommandReader {
         CommandReader { buffer: String::new() }
     }
 
-    pub fn poll(&mut self) -> Result<crate::ToNode, PollError> {
+    pub fn poll(&mut self) -> Result<Command, PollError> {
         // Keep draining events as long as there are new events available
         loop {
             match crossterm::event::poll(Duration::from_secs(0))? {
