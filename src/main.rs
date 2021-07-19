@@ -87,6 +87,11 @@ fn difficulty(hash: &[u8; 32]) -> u8 {
 //            Maybe just choose a node and ask it to send a full history
 //       Phase 2, maintain the blockchain & mine
 //
+// TODO: In line with the syncing phase, do not spam the network as much/be smarter about when to
+//       request
+// TODO: Add transactions to blocks
+// TODO: Handle blocks of different sizes, AKA don't assume all blocks have the same size, but DO
+//       assume a max size for buffer purposes/DOS-protection
 // TODO: Persist peers on shutdown
 // TODO: Clean up all the unwraps
 // TODO: Simulate poor network conditions
