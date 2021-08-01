@@ -77,6 +77,9 @@ impl Display for Direction {
 // TODO: Simulate poor network conditions
 // TODO: !important! Do not open connection twice between nodes (one outbound and one inbound)
 //       geth: Peer ID is the public key and is exchanged as part of the handshake
+//       Gen public key on start
+//       Add challenge response, only acknowledge a peer by it's given public ID if it can solve
+//       a random challenge
 
 #[derive(StructOpt, Debug)]
 #[structopt()]
@@ -145,7 +148,7 @@ fn main() -> io::Result<()> {
     }
 
     if should_mine_on_startup {
-        miner_sender.send(ToMiner::Start(node.blockchain.top().clone())).unwrap();
+        miner_sender.send(ToMiner::Start(node.blockchain.top().unwrap().clone())).unwrap();
     }
     let mut terminal_input_enabled = true;
     let mut command_reader = terminal_input::CommandReader::new();
@@ -167,12 +170,15 @@ fn main() -> io::Result<()> {
                     Ok(Command::SendPing) =>
                         networking_sender.send(Outgoing::Broadcast(NetworkedMessage::Ping)).unwrap(),
                     Ok(Command::StartMiner) =>
-                        miner_sender.send(ToMiner::Start(node.blockchain.top().clone())).unwrap(),
+                        miner_sender.send(ToMiner::Start(node.blockchain.top().unwrap().clone())).unwrap(),
                     Ok(Command::StopMiner) => miner_sender.send(ToMiner::Stop).unwrap(),
-                    Ok(Command::ShowTopBlock) => eprintln!(
-                        "{}, height: {}",
-                        node.blockchain.top(),
-                        node.blockchain.height(node.blockchain.top().hash()).unwrap()),
+                    Ok(Command::ShowTopBlock) => {
+                        let top = node.blockchain.top().unwrap();
+                        eprintln!(
+                            "{}, height: {}",
+                            top,
+                            node.blockchain.height(top.hash()).unwrap())
+                    },
                     Ok(Command::Peers) => eprintln!("{:?}", node.peers),
                     Ok(Command::Blocks) => node.blockchain.print_blocks().unwrap(),
                     Err(PollError::WouldBlock) => break,

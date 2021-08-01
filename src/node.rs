@@ -56,13 +56,14 @@ impl Node {
                 Ok(Message(peer, Block(block))) => {
                     eprintln!("Got block {} from {}", hex::encode(block.hash()), peer);
                     if !self.blockchain.contains(&block.hash()) {
-                        let old_height = self.blockchain.height(self.blockchain.top().hash()).unwrap();
+                        let top = self.blockchain.top().unwrap();
+                        let old_top_height = self.blockchain.height(top.hash()).unwrap();
                         match self.blockchain.add(block) {
                             Ok(()) => {
                                 eprintln!("Inserting new block {}\nBlock height: {}", block,
                                           self.blockchain.height(&block.hash()).unwrap());
                                 self.networking_sender.send(Outgoing::Forward(peer, NetworkedMessage::Block(block))).unwrap();
-                                if self.blockchain.height(&block.hash()).unwrap() > old_height {
+                                if self.blockchain.height(&block.hash()).unwrap() > old_top_height {
                                     self.miner_sender.send(ToMiner::Reset(block)).unwrap();
                                 }
 
@@ -117,7 +118,7 @@ impl Node {
                 }
                 Ok(ConnectionEstablished(peer)) => {
                     self.peers.push(peer);
-                    self.networking_sender.send(Outgoing::Send(peer, NetworkedMessage::Block(self.blockchain.top()))).unwrap();
+                    self.networking_sender.send(Outgoing::Send(peer, NetworkedMessage::Block(self.blockchain.top().unwrap()))).unwrap();
                     self.networking_sender.send(Outgoing::Send(peer, NetworkedMessage::PeerAddresses(self.peers.clone()))).unwrap();
                 }
                 Ok(ConnectionClosed(peer)) => {

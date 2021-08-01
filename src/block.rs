@@ -56,6 +56,10 @@ pub fn difficulty(hash: &[u8; 32]) -> u8 {
     trailing_zeros
 }
 
+pub fn difficulty_target(_block: &Block) -> u8 {
+    1
+}
+
 impl Block {
     pub const SERIALIZED_LEN: u8 = 32 + 32 + 8 + 8;
 

@@ -4,8 +4,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 
 use crate::block;
-use crate::block::Block;
-use crate::block::difficulty;
+use crate::block::{Block, difficulty_target};
 
 #[derive(Debug)]
 pub enum Error {
@@ -33,13 +32,19 @@ impl From<block::DeserializeError> for Error {
 pub struct Blockchain {
     file: File,
     genesis: Block,
-    blocks_addresses: HashMap<[u8; 32], u64>,
-    top: Block,
+    block_entries: HashMap<[u8; 32], BlockEntry>,
+    top: BlockEntry,
+}
+
+#[derive(Debug, Copy, Clone)]
+pub struct BlockEntry {
+    address: u64,
+    height: u64,
 }
 
 impl Blockchain {
     pub fn new(genesis: Block, path: &str) -> Result<Blockchain, Error> {
-        let mut blocks_addresses = HashMap::new();
+        let mut block_entries = HashMap::new();
         let mut file = OpenOptions::new().read(true).write(true).create(true).open(path)?;
         file.seek(SeekFrom::Start(0))?;
         let genesis = match Block::read(&mut file) {
@@ -62,17 +67,20 @@ impl Blockchain {
                 genesis
             }
         };
-        blocks_addresses.insert(*genesis.hash(), 0);
-        let mut blockchain = Blockchain { file, blocks_addresses, genesis, top: genesis };
+        let genesis_entry = BlockEntry { address: 0, height: 0 };
+        block_entries.insert(*genesis.hash(), genesis_entry.clone());
+        let mut blockchain = Blockchain { file, block_entries, genesis, top: genesis_entry };
 
         loop {
             let address = blockchain.file.stream_position()?;
             match Block::read(&mut blockchain.file) {
                 Ok(block) => {
-                    blockchain.blocks_addresses.insert(*block.hash(), address);
+                    let height = blockchain.height(&block.parent_hash()).unwrap() + 1;
+                    let block_entry = BlockEntry { address, height };
+                    blockchain.block_entries.insert(*block.hash(), block_entry.clone());
                     let top = blockchain.top;
-                    if blockchain.height(block.hash())? > blockchain.height(top.hash())? {
-                        blockchain.top = block;
+                    if height > top.height {
+                        blockchain.top = block_entry;
                     }
                     blockchain.file.seek(SeekFrom::Start(address + u64::from(Block::SERIALIZED_LEN)))?;
                 }
@@ -88,24 +96,25 @@ impl Blockchain {
     }
 
     pub fn add(&mut self, block: Block) -> Result<(), Error> {
-        match self.blocks_addresses.get(&block.parent_hash()) {
-            Some(parent_address) => {
+        match self.block_entries.get(&block.parent_hash()) {
+            Some(BlockEntry { address: parent_address, height: parent_height }) => {
                 eprintln!("Reading parent {}", parent_address);
                 self.file.seek(SeekFrom::Start(*parent_address))?;
                 let parent = Block::read(&mut self.file)?;
+                let height = parent_height + 1;
 
-                /*if difficulty(block.hash()) < parent.difficulty() {
+                if block.difficulty() < difficulty_target(&parent) {
                     Err(Error::InvalidHash)
-                } else*/ {
+                } else {
                     self.file.seek(SeekFrom::End(0))?;
                     let address = self.file.stream_position()?;
                     block.write(&mut self.file)?;
                     self.file.flush()?;
-                    let top = self.top;
-                    if self.height(parent.hash())? + 1 > self.height(top.hash())? {
-                        self.top = block;
+                    let block_entry = BlockEntry { address, height };
+                    if height > self.top.height {
+                        self.top = block_entry.clone();
                     }
-                    self.blocks_addresses.insert(*block.hash(), address);
+                    self.block_entries.insert(*block.hash(), block_entry);
                     Ok(())
                 }
             }
@@ -114,8 +123,8 @@ impl Blockchain {
     }
 
     pub fn get(&mut self, hash: &[u8; 32]) -> Result<Block, Error> {
-        match self.blocks_addresses.get(hash) {
-            Some(address) => {
+        match self.block_entries.get(hash) {
+            Some(BlockEntry { address, .. }) => {
                 self.file.seek(SeekFrom::Start(*address))?;
                 Ok(Block::read(&mut self.file)?)
             }
@@ -125,7 +134,7 @@ impl Blockchain {
 
     // Returns the child of the main chain
     pub fn get_child(&mut self, parent_hash: &[u8; 32]) -> Result<Block, Error> {
-        let mut block = self.top;
+        let mut block = self.top()?;
         while block.parent_hash() != *parent_hash {
             block = self.get(&block.parent_hash())?
         }
@@ -137,22 +146,17 @@ impl Blockchain {
         self.genesis
     }
 
-    pub fn top(&self) -> Block {
-        self.top
+    pub fn top(&mut self) -> Result<Block, Error> {
+        self.file.seek(SeekFrom::Start(self.top.address))?;
+        Ok(Block::read(&mut self.file)?)
     }
 
     pub fn height(&mut self, hash: &[u8; 32]) -> Result<u64, Error> {
-        let mut block = self.get(hash)?;
-        let mut height = 0;
-        while block.hash() != self.genesis.hash() {
-            block = self.get(&block.parent_hash())?;
-            height += 1;
-        }
-        Ok(height)
+        self.block_entries.get(hash).map(|x| x.height).ok_or(Error::NotFound)
     }
 
     pub fn contains(&self, hash: &[u8; 32]) -> bool {
-        self.blocks_addresses.contains_key(hash)
+        self.block_entries.contains_key(hash)
     }
 
     pub fn print_blocks(&mut self) -> Result<(), Error> {
@@ -162,7 +166,7 @@ impl Blockchain {
             match Block::read(&mut self.file) {
                 Ok(block) => {
                     let height = self.height(block.hash())?;
-                    let top = block.hash() == self.top.hash();
+                    let top = block.hash() == self.top()?.hash();
                     eprintln!("{}, height: {}, top: {}", block, height, top);
                     self.file.seek(SeekFrom::Start(address + u64::from(Block::SERIALIZED_LEN)))?;
                 }
