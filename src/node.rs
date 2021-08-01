@@ -65,6 +65,8 @@ impl Node {
                                 if self.blockchain.height(&block.hash()).unwrap() > old_height {
                                     self.miner_sender.send(ToMiner::Reset(block)).unwrap();
                                 }
+
+                                self.networking_sender.send(Outgoing::Send(peer, NetworkedMessage::RequestChild(*block.hash()))).unwrap();
                             }
                             Err(blockchain::Error::MissingParent) => {
                                 self.networking_sender.send(Outgoing::Send(peer, NetworkedMessage::Request(block.parent_hash()))).unwrap();

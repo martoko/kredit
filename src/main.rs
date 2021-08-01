@@ -169,7 +169,10 @@ fn main() -> io::Result<()> {
                     Ok(Command::StartMiner) =>
                         miner_sender.send(ToMiner::Start(node.blockchain.top().clone())).unwrap(),
                     Ok(Command::StopMiner) => miner_sender.send(ToMiner::Stop).unwrap(),
-                    Ok(Command::ShowTopBlock) => eprintln!("{}", node.blockchain.top()),
+                    Ok(Command::ShowTopBlock) => eprintln!(
+                        "{}, height: {}",
+                        node.blockchain.top(),
+                        node.blockchain.height(node.blockchain.top().hash()).unwrap()),
                     Ok(Command::Peers) => eprintln!("{:?}", node.peers),
                     Ok(Command::Blocks) => node.blockchain.print_blocks().unwrap(),
                     Err(PollError::WouldBlock) => break,

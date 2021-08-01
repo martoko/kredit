@@ -26,7 +26,7 @@ pub fn spawn_miner(
                     let mut start_time = SystemTime::now();
                     let mut parent_hash = *parent_block.hash();
                     let mut nonce: u64 = 0;
-                    let mut difficulty_target: u8 = parent_block.difficulty();
+                    let difficulty_target: u8 = 1;
                     let mut time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
 
                     loop {
@@ -37,7 +37,7 @@ pub fn spawn_miner(
                                 start_time = SystemTime::now();
                                 parent_hash = *parent_block.hash();
                                 nonce = 0;
-                                difficulty_target = parent_block.difficulty();
+                                // difficulty_target = parent_block.difficulty();
                                 time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
                             }
                             Err(TryRecvError::Empty) => {
@@ -79,7 +79,7 @@ pub fn spawn_miner(
                                             start_time = SystemTime::now();
                                             parent_hash = *parent_block.hash();
                                             nonce = 0;
-                                            difficulty_target = parent_block.difficulty();
+                                            // difficulty_target = parent_block.difficulty();
                                             time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
                                         }
                                         Ok(ToMiner::Stop) => break,
