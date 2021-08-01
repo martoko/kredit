@@ -32,8 +32,8 @@ pub fn spawn_miner(
                     loop {
                         match receiver.try_recv() {
                             // Cancel the current mining in favor of this parent block
-                            Ok(ToMiner::Start(parent_block)) |
-                            Ok(ToMiner::Reset(parent_block)) => {
+                            Ok(ToMiner::Reset(parent_block)) |
+                            Ok(ToMiner::Start(parent_block)) => {
                                 start_time = SystemTime::now();
                                 parent_hash = *parent_block.hash();
                                 nonce = 0;
@@ -52,8 +52,9 @@ pub fn spawn_miner(
                                 if block::difficulty(&hash) >= difficulty_target {
                                     let duration = start_time.elapsed().unwrap();
                                     // Artificially make the minimum mining time 2 seconds for debug
-                                    // if let Some(duration) = Duration::from_secs(2).checked_sub(duration) {
-                                    //     sleep(duration);
+                                    // if let Some(duration) = std::time::Duration::from_secs(2)
+                                    //     .checked_sub(duration) {
+                                    //     std::thread::sleep(duration);
                                     // }
                                     let seconds = duration.as_secs() % 60;
                                     let minutes = (duration.as_secs() / 60) % 60;
@@ -67,9 +68,23 @@ pub fn spawn_miner(
                                         eprintln!("Mining took {} second(s)", seconds);
                                     }
 
-                                    sender.send(Incoming::Mined(
+                                    if let Err(_) = sender.send(Incoming::Mined(
                                         Block::new(parent_hash, miner_address, nonce, time)
-                                    )).unwrap();
+                                    )) {
+                                        break;
+                                    }
+                                    match receiver.recv() {
+                                        Ok(ToMiner::Reset(parent_block)) |
+                                        Ok(ToMiner::Start(parent_block)) => {
+                                            start_time = SystemTime::now();
+                                            parent_hash = *parent_block.hash();
+                                            nonce = 0;
+                                            difficulty_target = parent_block.difficulty();
+                                            time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                                        }
+                                        Ok(ToMiner::Stop) => break,
+                                        Err(RecvError {}) => break,
+                                    }
                                 }
                             }
                             // Pause the mining

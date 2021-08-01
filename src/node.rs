@@ -103,9 +103,15 @@ impl Node {
                     }
                 }
                 Ok(Mined(block)) => {
-                    self.blockchain.add(block).unwrap();
-                    self.networking_sender.send(Outgoing::Broadcast(Block(block))).unwrap();
-                    self.miner_sender.send(ToMiner::Reset(block)).unwrap();
+                    match self.blockchain.add(block) {
+                        Ok(()) => {
+                            eprintln!("Mined new block {}\nBlock height: {}", block,
+                                      self.blockchain.height(&block.hash()).unwrap());
+                            self.networking_sender.send(Outgoing::Broadcast(Block(block))).unwrap();
+                            self.miner_sender.send(ToMiner::Reset(block)).unwrap();
+                        }
+                        Err(e) => eprintln!("Failed to add mined block: {:?}", e)
+                    }
                 }
                 Ok(ConnectionEstablished(peer)) => {
                     self.peers.push(peer);

@@ -94,7 +94,7 @@ impl Blockchain {
                 self.file.seek(SeekFrom::Start(*parent_address))?;
                 let parent = Block::read(&mut self.file)?;
 
-                if difficulty(block.hash()) != parent.difficulty() {
+                if difficulty(block.hash()) < parent.difficulty() {
                     Err(Error::InvalidHash)
                 } else {
                     self.file.seek(SeekFrom::End(0))?;
