@@ -4,7 +4,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 
 use crate::block;
-use crate::block::{Block, difficulty_target};
+use crate::block::{Block};
 
 #[derive(Debug)]
 pub enum Error {
@@ -103,7 +103,7 @@ impl Blockchain {
                 let parent = Block::read(&mut self.file)?;
                 let height = parent_height + 1;
 
-                if block.difficulty() < difficulty_target(&parent) {
+                if block.difficulty() < self.difficulty_target(&parent)? {
                     Err(Error::InvalidHash)
                 } else {
                     self.file.seek(SeekFrom::End(0))?;
@@ -151,12 +151,23 @@ impl Blockchain {
         Ok(Block::read(&mut self.file)?)
     }
 
-    pub fn height(&mut self, hash: &[u8; 32]) -> Result<u64, Error> {
+    pub fn height(&self, hash: &[u8; 32]) -> Result<u64, Error> {
         self.block_entries.get(hash).map(|x| x.height).ok_or(Error::NotFound)
     }
 
     pub fn contains(&self, hash: &[u8; 32]) -> bool {
         self.block_entries.contains_key(hash)
+    }
+
+    pub fn difficulty_target(&self, block: &Block) -> Result<u8, Error> {
+        let height = self.height(block.hash())?;
+        if height > 3400 {
+            Ok(3)
+        } else if height > 3342 {
+            Ok(2)
+        } else {
+            Ok(1)
+        }
     }
 
     pub fn print_blocks(&mut self) -> Result<(), Error> {

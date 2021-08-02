@@ -64,7 +64,9 @@ impl Node {
                                           self.blockchain.height(&block.hash()).unwrap());
                                 self.networking_sender.send(Outgoing::Forward(peer, NetworkedMessage::Block(block))).unwrap();
                                 if self.blockchain.height(&block.hash()).unwrap() > old_top_height {
-                                    self.miner_sender.send(ToMiner::Reset(block)).unwrap();
+                                    self.miner_sender.send(ToMiner::Reset(
+                                        self.blockchain.difficulty_target(&block).unwrap(), block)
+                                    ).unwrap();
                                 }
 
                                 self.networking_sender.send(Outgoing::Send(peer, NetworkedMessage::RequestChild(*block.hash()))).unwrap();
@@ -111,7 +113,9 @@ impl Node {
                             eprintln!("Mined new block {}\nBlock height: {}", block,
                                       self.blockchain.height(&block.hash()).unwrap());
                             self.networking_sender.send(Outgoing::Broadcast(Block(block))).unwrap();
-                            self.miner_sender.send(ToMiner::Reset(block)).unwrap();
+                            self.miner_sender.send(ToMiner::Reset(
+                                self.blockchain.difficulty_target(&block).unwrap(), block,
+                            )).unwrap();
                         }
                         Err(e) => eprintln!("Failed to add mined block: {:?}", e)
                     }

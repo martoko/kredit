@@ -9,8 +9,8 @@ use crate::node::Incoming;
 
 #[derive(Debug, Copy, Clone)]
 pub enum ToMiner {
-    Start(Block),
-    Reset(Block),
+    Start(u8, Block),
+    Reset(u8, Block),
     Stop,
 }
 
@@ -22,22 +22,22 @@ pub fn spawn_miner(
     let miner_thread = spawn_with_name("miner", move || -> io::Result<()> {
         loop {
             match receiver.recv() {
-                Ok(ToMiner::Start(parent_block)) => {
+                Ok(ToMiner::Start(new_difficulty_target, parent_block)) => {
                     let mut start_time = SystemTime::now();
                     let mut parent_hash = *parent_block.hash();
                     let mut nonce: u64 = 0;
-                    let mut difficulty_target: u8 = block::difficulty_target(&parent_block);
                     let mut time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                    let mut difficulty_target = new_difficulty_target;
 
                     loop {
                         match receiver.try_recv() {
                             // Cancel the current mining in favor of this parent block
-                            Ok(ToMiner::Reset(parent_block)) |
-                            Ok(ToMiner::Start(parent_block)) => {
+                            Ok(ToMiner::Reset(new_difficulty_target, parent_block)) |
+                            Ok(ToMiner::Start(new_difficulty_target, parent_block)) => {
                                 start_time = SystemTime::now();
                                 parent_hash = *parent_block.hash();
                                 nonce = 0;
-                                difficulty_target = block::difficulty_target(&parent_block);
+                                difficulty_target = new_difficulty_target;
                                 time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
                             }
                             Err(TryRecvError::Empty) => {
@@ -74,12 +74,12 @@ pub fn spawn_miner(
                                         break;
                                     }
                                     match receiver.recv() {
-                                        Ok(ToMiner::Reset(parent_block)) |
-                                        Ok(ToMiner::Start(parent_block)) => {
+                                        Ok(ToMiner::Reset(new_difficulty_target, parent_block)) |
+                                        Ok(ToMiner::Start(new_difficulty_target, parent_block)) => {
                                             start_time = SystemTime::now();
                                             parent_hash = *parent_block.hash();
                                             nonce = 0;
-                                            // difficulty_target = parent_block.difficulty();
+                                            difficulty_target = new_difficulty_target;
                                             time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
                                         }
                                         Ok(ToMiner::Stop) => break,
@@ -95,7 +95,7 @@ pub fn spawn_miner(
                     }
                 }
                 Ok(ToMiner::Stop) |
-                Ok(ToMiner::Reset(_)) => { /* Ignore stop requests when not mining. */ }
+                Ok(ToMiner::Reset(..)) => { /* Ignore stop requests when not mining. */ }
                 // Channel has been closed, and so we do the same for the thread
                 Err(RecvError {}) => break
             }

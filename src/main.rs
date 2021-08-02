@@ -80,6 +80,7 @@ impl Display for Direction {
 //       Gen public key on start
 //       Add challenge response, only acknowledge a peer by it's given public ID if it can solve
 //       a random challenge
+// TODO: Both client miners start nonces from 0, prevents a true random distribution
 
 #[derive(StructOpt, Debug)]
 #[structopt()]
@@ -148,7 +149,10 @@ fn main() -> io::Result<()> {
     }
 
     if should_mine_on_startup {
-        miner_sender.send(ToMiner::Start(node.blockchain.top().unwrap().clone())).unwrap();
+        let top = node.blockchain.top().unwrap();
+        miner_sender.send(ToMiner::Start(
+            node.blockchain.difficulty_target(&top).unwrap(), top.clone(),
+        )).unwrap();
     }
     let mut terminal_input_enabled = true;
     let mut command_reader = terminal_input::CommandReader::new();
@@ -169,8 +173,13 @@ fn main() -> io::Result<()> {
                         networking_sender.send(Outgoing::Connect(addr)).unwrap(),
                     Ok(Command::SendPing) =>
                         networking_sender.send(Outgoing::Broadcast(NetworkedMessage::Ping)).unwrap(),
-                    Ok(Command::StartMiner) =>
-                        miner_sender.send(ToMiner::Start(node.blockchain.top().unwrap().clone())).unwrap(),
+                    Ok(Command::StartMiner) => {
+                        let top = node.blockchain.top().unwrap();
+                        miner_sender.send(ToMiner::Start(
+                            node.blockchain.difficulty_target(&top).unwrap(),
+                            top.clone())
+                        ).unwrap();
+                    }
                     Ok(Command::StopMiner) => miner_sender.send(ToMiner::Stop).unwrap(),
                     Ok(Command::ShowTopBlock) => {
                         let top = node.blockchain.top().unwrap();
@@ -178,7 +187,7 @@ fn main() -> io::Result<()> {
                             "{}, height: {}",
                             top,
                             node.blockchain.height(top.hash()).unwrap())
-                    },
+                    }
                     Ok(Command::Peers) => eprintln!("{:?}", node.peers),
                     Ok(Command::Blocks) => node.blockchain.print_blocks().unwrap(),
                     Err(PollError::WouldBlock) => break,
