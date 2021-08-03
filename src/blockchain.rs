@@ -161,9 +161,9 @@ impl Blockchain {
 
     pub fn difficulty_target(&self, block: &Block) -> Result<u8, Error> {
         let height = self.height(block.hash())?;
-        if height > 3400 {
+        if height > 1010 {
             Ok(3)
-        } else if height > 3342 {
+        } else if height > 1000 {
             Ok(2)
         } else {
             Ok(1)
