@@ -1,5 +1,9 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
+
+use ed25519_dalek::{Keypair, PublicKey, Signer, Verifier};
+use rand::Rng;
 
 use NetworkedMessage::*;
 
@@ -27,10 +31,12 @@ pub enum Incoming {
 /// A node handles messages to and from peers, but is oblivious to the underlying networking.
 pub struct Node {
     pub blockchain: Blockchain,
-    pub peers: Vec<SocketAddr>,
+    // Maybe split into verified vec<(SocketAddr, PublicKey)> and unverified peers vec<(SocketAddr, challenge)>
+    pub peers: HashMap<SocketAddr, ([u8; 32], Option<PublicKey>)>,
     node_receiver: Receiver<Incoming>,
     networking_sender: Sender<Outgoing>,
     miner_sender: Sender<ToMiner>,
+    keypair: Keypair,
 }
 
 impl Node {
@@ -40,7 +46,14 @@ impl Node {
         networking_sender: Sender<Outgoing>,
         miner_sender: Sender<ToMiner>,
     ) -> Node {
-        Node { blockchain, node_receiver, networking_sender, miner_sender, peers: vec![] }
+        Node {
+            blockchain,
+            node_receiver,
+            networking_sender,
+            miner_sender,
+            peers: HashMap::new(),
+            keypair: Keypair::generate(&mut rand_0_7::rngs::OsRng {}),
+        }
     }
 
     pub fn process(&mut self) {
@@ -96,15 +109,41 @@ impl Node {
                         Err(error) => eprintln!("{:?}", error),
                     }
                 }
-                Ok(Message(_peer, PeerAddresses(peers))) => {
+                Ok(Message(_peer, Peers(peers))) => {
                     eprintln!("Got {} peers", peers.len());
-                    for peer in peers {
-                        if self.peers.contains(&peer) {
-                            eprintln!("Got existing peer {}", peer)
+                    for (peer_addr, peer_public_key) in peers {
+                        if self.peers.iter().any(|(addr, (_, public_key))| *addr == peer_addr || Some(peer_public_key) == *public_key) {
+                            eprintln!("Got existing peer {:?}, {}", peer_public_key, peer_addr)
                         } else {
-                            eprintln!("Got new peer {}", peer);
-                            self.networking_sender.send(Outgoing::Connect(peer)).unwrap()
+                            eprintln!("Got new peer {}", peer_addr);
+                            self.networking_sender.send(Outgoing::Connect(peer_addr)).unwrap()
                         }
+                    }
+                }
+                // A client is challenging our identity by asking us to sign a "challenge"
+                Ok(Message(peer, Challenge(challenge))) => {
+                    eprintln!("Got {} challenge from {}", hex::encode(challenge), peer);
+                    self.networking_sender.send(Outgoing::Send(
+                        peer,
+                        NetworkedMessage::ChallengeResponse {
+                            public_key: self.keypair.public,
+                            signature: self.keypair.sign(&challenge),
+                        },
+                    )).unwrap()
+                }
+                Ok(Message(peer_address, ChallengeResponse { signature, public_key })) => {
+                    match self.peers.get(&peer_address) {
+                        Some((challenge, ..)) => {
+                            let challenge = *challenge;
+                            match public_key.verify(&challenge, &signature) {
+                                Ok(()) => {
+                                    eprintln!("Received valid challenge response from {}", peer_address);
+                                    self.peers.insert(peer_address, (challenge, Some(public_key)));
+                                }
+                                Err(e) => eprintln!("Received invalid challenge response from {}: {}", peer_address, e)
+                            }
+                        }
+                        None => eprintln!("Received unsolicited challenge response from {}", peer_address)
                     }
                 }
                 Ok(Mined(block)) => {
@@ -120,13 +159,20 @@ impl Node {
                         Err(e) => eprintln!("Failed to add mined block: {:?}", e)
                     }
                 }
-                Ok(ConnectionEstablished(peer)) => {
-                    self.peers.push(peer);
-                    self.networking_sender.send(Outgoing::Send(peer, NetworkedMessage::Block(self.blockchain.top().unwrap()))).unwrap();
-                    self.networking_sender.send(Outgoing::Send(peer, NetworkedMessage::PeerAddresses(self.peers.clone()))).unwrap();
+                Ok(ConnectionEstablished(peer_address)) => {
+                    let challenge = rand::thread_rng().gen::<[u8; 32]>();
+                    if let Some(_) = self.peers.insert(peer_address, (challenge, None)) {
+                        eprintln!("Connection established twice for {}", peer_address);
+                    }
+                    self.networking_sender.send(Outgoing::Send(peer_address, NetworkedMessage::Challenge(challenge))).unwrap();
+                    self.networking_sender.send(Outgoing::Send(peer_address, NetworkedMessage::Block(self.blockchain.top().unwrap()))).unwrap();
+                    let peers = self.peers.iter().filter_map(|(addr, (_, public_key))| {
+                        public_key.map(|public_key| (*addr, public_key))
+                    }).collect();
+                    self.networking_sender.send(Outgoing::Send(peer_address, NetworkedMessage::Peers(peers))).unwrap();
                 }
-                Ok(ConnectionClosed(peer)) => {
-                    self.peers.retain(|p| *p != peer);
+                Ok(ConnectionClosed(peer_adress)) => {
+                    self.peers.remove(&peer_adress);
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => break,

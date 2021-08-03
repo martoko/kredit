@@ -59,11 +59,6 @@ impl Display for Direction {
     }
 }
 
-// TODO: !important! Do not open connection twice between nodes (one outbound and one inbound)
-//       geth: Peer ID is the public key and is exchanged as part of the handshake
-//       Gen public key on start
-//       Add challenge response, only acknowledge a peer by it's given public ID if it can solve
-//       a random challenge
 // TODO: # Introduce sync phase #
 //       Phase 1, Sync:
 //         seed peers

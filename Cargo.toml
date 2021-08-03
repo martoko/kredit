@@ -13,3 +13,5 @@ ctrlc = "3.1.9"
 structopt = "0.3.21"
 rand = "0.8.4"
 chrono = "0.4.19"
+rand_0_7 = { package = "rand", version = "0.7" }
+ed25519-dalek = "1.0.1"

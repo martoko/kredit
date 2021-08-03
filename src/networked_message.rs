@@ -2,6 +2,8 @@ use std::{array, io};
 use std::io::{BufWriter, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, TcpStream};
 
+use ed25519_dalek::*;
+
 use crate::block;
 use crate::block::Block;
 
@@ -10,9 +12,14 @@ pub enum NetworkedMessage {
     Block(Block),
     Ping,
     Pong,
+    // Each node has a unique id, their public key.
+    // We can challenge a node on their public key to confirm their identity.
+    // This is more less only useful for not connecting to the same node twice.
+    Challenge([u8; 32]),
+    ChallengeResponse { signature: Signature, public_key: PublicKey },
     Request([u8; 32]),
     RequestChild([u8; 32]),
-    PeerAddresses(Vec<SocketAddr>),
+    Peers(Vec<(SocketAddr, PublicKey)>),
 }
 
 #[derive(Debug)]
@@ -20,6 +27,7 @@ pub enum DeserializeError {
     Io(io::Error),
     ArrayTryFromSlice(array::TryFromSliceError),
     BlockDeserialize(block::DeserializeError),
+    Ed25519Error(ed25519_dalek::ed25519::Error),
     InvalidSocketAddrType(u8),
     InvalidMessageType(u8),
 }
@@ -34,6 +42,10 @@ impl From<array::TryFromSliceError> for DeserializeError {
 
 impl From<block::DeserializeError> for DeserializeError {
     fn from(e: block::DeserializeError) -> Self { DeserializeError::BlockDeserialize(e) }
+}
+
+impl From<ed25519_dalek::ed25519::Error> for DeserializeError {
+    fn from(e: ed25519_dalek::ed25519::Error) -> Self { DeserializeError::Ed25519Error(e) }
 }
 
 impl NetworkedMessage {
@@ -106,14 +118,42 @@ impl NetworkedMessage {
                     stream.set_nonblocking(true)?;
                     let port = u16::from_le_bytes(buffer);
 
-                    let peer = match ip {
+                    let addr = match ip {
                         IpAddr::V4(ip) => SocketAddr::from(SocketAddrV4::new(ip, port)),
                         IpAddr::V6(ip) => SocketAddr::from(SocketAddrV6::new(ip, port, 0, 0))
                     };
 
-                    peers.push(peer);
+                    let mut buffer = [0; PUBLIC_KEY_LENGTH];
+                    stream.set_nonblocking(false)?;
+                    (&mut (&*stream)).read_exact(&mut buffer)?;
+                    stream.set_nonblocking(true)?;
+                    let public_key = PublicKey::from_bytes(&buffer)?;
+
+                    peers.push((addr, public_key));
                 }
-                Ok(NetworkedMessage::PeerAddresses(peers))
+                Ok(NetworkedMessage::Peers(peers))
+            }
+            6 => {
+                let mut buffer = [0; 32];
+                stream.set_nonblocking(false)?;
+                (&mut (&*stream)).read_exact(&mut buffer)?;
+                stream.set_nonblocking(true)?;
+                Ok(NetworkedMessage::Challenge(buffer))
+            }
+            7 => {
+                let mut buffer = [0; 64];
+                stream.set_nonblocking(false)?;
+                (&mut (&*stream)).read_exact(&mut buffer)?;
+                stream.set_nonblocking(true)?;
+                let signature = buffer.into();
+
+                let mut buffer = [0; 32];
+                stream.set_nonblocking(false)?;
+                (&mut (&*stream)).read_exact(&mut buffer)?;
+                stream.set_nonblocking(true)?;
+                let public_key = PublicKey::from_bytes(&buffer)?;
+
+                Ok(NetworkedMessage::ChallengeResponse { signature, public_key })
             }
             r#type => Err(DeserializeError::InvalidMessageType(r#type))
         }
@@ -149,11 +189,11 @@ impl NetworkedMessage {
                 writer.flush()?;
                 Ok(())
             }
-            NetworkedMessage::PeerAddresses(peers) => {
+            NetworkedMessage::Peers(peers) => {
                 writer.write_all(&[5])?;
                 writer.write_all(&(peers.len() as u64).to_le_bytes())?;
-                for peer in peers {
-                    match peer {
+                for (addr, public_key) in peers {
+                    match addr {
                         SocketAddr::V4(addr) => {
                             writer.write_all(&[0])?;
                             writer.write_all(&addr.ip().octets())?;
@@ -165,7 +205,21 @@ impl NetworkedMessage {
                             writer.write_all(&addr.port().to_le_bytes())?;
                         }
                     }
+                    writer.write_all(&public_key.to_bytes())?;
                 }
+                writer.flush()?;
+                Ok(())
+            }
+            NetworkedMessage::Challenge(challenge) => {
+                writer.write_all(&[6])?;
+                writer.write_all(challenge)?;
+                writer.flush()?;
+                Ok(())
+            }
+            NetworkedMessage::ChallengeResponse { signature: ciphertext, public_key } => {
+                writer.write_all(&[7])?;
+                writer.write_all(&ciphertext.to_bytes())?;
+                writer.write_all(&public_key.to_bytes())?;
                 writer.flush()?;
                 Ok(())
             }
