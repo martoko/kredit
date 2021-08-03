@@ -2,6 +2,7 @@ use std::{array, fmt, io};
 use std::convert::TryInto;
 use std::io::{Read, Write};
 
+use chrono::{TimeZone, Utc};
 use sha2::{Digest, Sha256};
 
 #[derive(Debug)]
@@ -113,7 +114,7 @@ impl fmt::Display for Block {
                hex::encode(self.parent_hash),
                hex::encode(self.miner_address),
                hex::encode(self.nonce.to_le_bytes()),
-               self.time,
+               Utc.timestamp(self.time as i64, 0),
                self.difficulty)
     }
 }

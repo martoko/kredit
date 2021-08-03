@@ -4,7 +4,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 
 use crate::block;
-use crate::block::{Block};
+use crate::block::Block;
 
 #[derive(Debug)]
 pub enum Error {
@@ -161,7 +161,7 @@ impl Blockchain {
 
     pub fn difficulty_target(&self, block: &Block) -> Result<u8, Error> {
         let height = self.height(block.hash())?;
-        if height > 1010 {
+        if height > 1100 {
             Ok(3)
         } else if height > 1000 {
             Ok(2)
@@ -171,24 +171,25 @@ impl Blockchain {
     }
 
     pub fn print_blocks(&mut self) -> Result<(), Error> {
-        self.file.seek(SeekFrom::Start(0))?;
-        loop {
-            let address = self.file.stream_position()?;
-            match Block::read(&mut self.file) {
+        let mut top_blocks = vec![self.top()?];
+        let mut last_block = self.top()?;
+        for _ in 0..100 {
+            match self.get(&last_block.parent_hash()) {
                 Ok(block) => {
-                    let height = self.height(block.hash())?;
-                    let top = block.hash() == self.top()?.hash();
-                    eprintln!("{}, height: {}, top: {}", block, height, top);
-                    self.file.seek(SeekFrom::Start(address + u64::from(Block::SERIALIZED_LEN)))?;
+                    top_blocks.push(block);
+                    last_block = block;
                 }
-                Err(block::DeserializeError::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                    break;
-                }
-                e => {
-                    e?;
-                }
+                Err(Error::NotFound) => break,
+                e => { e?; }
             }
         }
+
+        for block in top_blocks.iter().rev() {
+            let height = self.height(block.hash())?;
+            let top = block.hash() == self.top()?.hash();
+            eprintln!("{}, height: {}, top: {}", block, height, top);
+        }
+
         Ok(())
     }
 }

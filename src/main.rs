@@ -14,6 +14,7 @@ use crate::miner::ToMiner;
 use crate::networking::Networking;
 use crate::node::{Node, Outgoing};
 use crate::terminal_input::{Command, PollError};
+use rand::Rng;
 
 mod blockchain;
 mod terminal_input;
@@ -58,7 +59,7 @@ impl Display for Direction {
     }
 }
 
- // TODO: !important! Do not open connection twice between nodes (one outbound and one inbound)
+// TODO: !important! Do not open connection twice between nodes (one outbound and one inbound)
 //       geth: Peer ID is the public key and is exchanged as part of the handshake
 //       Gen public key on start
 //       Add challenge response, only acknowledge a peer by it's given public ID if it can solve
@@ -130,8 +131,8 @@ fn main() -> io::Result<()> {
     }
 
     let blockchain = Blockchain::new(Block::new(
-        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        [0; 32],
+        [0; 32],
         0,
         1622999578, // SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
     ), &args.blockchain_path).unwrap();
@@ -141,7 +142,8 @@ fn main() -> io::Result<()> {
     let (miner_sender, miner_receiver) = channel();
     let mut networking = Networking::new(args.address, node_sender.clone(), networking_receiver);
     let mut node = Node::new(blockchain, node_receiver, networking_sender.clone(), miner_sender.clone());
-    let miner_thread = miner::spawn_miner([0; 32], miner_receiver, node_sender.clone());
+    let miner_address = rand::thread_rng().gen::<[u8; 32]>();
+    let miner_thread = miner::spawn_miner(miner_address, miner_receiver, node_sender.clone());
 
     for addr in args.connect {
         networking_sender.send(Outgoing::Connect(addr)).unwrap();
