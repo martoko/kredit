@@ -63,8 +63,6 @@ impl Display for Direction {
 //       Phase 1, Sync:
 //         seed peers
 //            For now just rely on the user specifying exact IP's
-//            In the future the nodes should exchange peers with each other
-//         synchronize blockchain
 //            Maybe just choose a node and ask it to send a full history
 //       Phase 2, maintain the blockchain & mine
 //

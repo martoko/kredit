@@ -96,6 +96,10 @@ impl Blockchain {
     }
 
     pub fn add(&mut self, block: Block) -> Result<(), Error> {
+        if self.block_entries.contains_key(block.hash()) {
+            return Ok(())
+        }
+
         match self.block_entries.get(&block.parent_hash()) {
             Some(BlockEntry { address: parent_address, height: parent_height }) => {
                 eprintln!("Reading parent {}", parent_address);
